@@ -7,6 +7,7 @@ import tempfile
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -116,6 +117,33 @@ def view_file(file_id: int, user: str = Depends(current_user), db: Session = Dep
     db.add(AuditLog(username=user, action="file.view", resource=str(file_id)))
     db.commit()
     return FileResponse(path, media_type=item.mime_type or "application/octet-stream", filename=item.original_name, content_disposition_type="inline")
+
+
+def _is_composed_report_image(item: ClinicalFile) -> bool:
+    if item.kind != "image" or item.mime_type not in {"image/jpeg", "image/png"}:
+        return False
+    path = (settings.storage_root / item.relative_path).resolve()
+    if settings.storage_root.resolve() not in path.parents or not path.is_file():
+        return False
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+        return width >= 1000 and width / height >= 1.5
+    except (OSError, UnidentifiedImageError):
+        return False
+
+
+@app.get("/api/studies/{study_id}/reports", response_model=list[FileOut])
+def study_reports(study_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+    study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.files)))
+    if not study:
+        raise HTTPException(404, "Study not found")
+    reports = [item for item in study.files if item.kind in {"report", "report_image"}]
+    reports.extend(item for item in study.files if item not in reports and _is_composed_report_image(item))
+    reports.sort(key=lambda item: (item.kind not in {"report", "report_image"}, item.id))
+    db.add(AuditLog(username=user, action="report.gallery.view", resource=f"study:{study_id}"))
+    db.commit()
+    return reports[:4]
 
 
 @app.get("/api/studies/{study_id}/inventory", response_model=StudyInventoryOut)

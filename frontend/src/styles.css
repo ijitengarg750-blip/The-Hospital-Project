@@ -4,7 +4,7 @@ body { margin: 0; min-width: 320px; min-height: 100vh; }
 button, input { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: .6; }
-button:focus-visible, summary:focus-visible, select:focus-visible { outline: 3px solid #bf8300; outline-offset: 3px; }
+button:focus-visible, a:focus-visible { outline: 3px solid #bf8300; outline-offset: 3px; }
 .setup-toggle { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-radius: 8px; margin: 0 0 18px auto; }
 .remote-setup { background: white; border: 1px solid #dce7e4; padding: 24px; border-radius: 12px; margin-bottom: 24px; }
 .remote-setup h2 { margin-top: 0; }
@@ -13,13 +13,6 @@ button:focus-visible, summary:focus-visible, select:focus-visible { outline: 3px
 .remote-input { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .remote-input input { flex: 1; min-width: 180px; padding: 10px; border: 1px solid #cddbd8; border-radius: 6px; }
 .remote-input button { border-radius: 6px; padding: 10px; }
-.source-files { margin-top: 22px; border-top: 1px solid #e3ecea; padding-top: 15px; }
-.source-files summary { cursor: pointer; color: #526b67; font-size: 14px; }
-.file-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 0; border-bottom: 1px solid #edf2f0; }
-.file-row button, .file-row select { padding: 9px 12px; border-radius: 6px; max-width: 100%; }
-.file-row button { display: inline-flex; align-items: center; gap: 7px; }
-.filename { overflow-wrap: anywhere; font-size: 12px; color: #526b67; flex: 1; min-width: 120px; }
-.text-button { background: transparent; border: 0; color: #526b67; text-decoration: underline; font-size: 12px; }
 .actions > .muted { font-size: 12px; align-self: center; }
 header { height: 68px; padding: 0 max(24px, calc((100vw - 1120px) / 2)); display: flex; align-items: center; justify-content: space-between; background: #fff; border-bottom: 1px solid #dce7e4; position: sticky; top: 0; z-index: 5; }
 .wordmark { display: flex; align-items: center; gap: 10px; color: #075e55; font-weight: 750; }
@@ -49,13 +42,23 @@ header { height: 68px; padding: 0 max(24px, calc((100vw - 1120px) / 2)); display
 .study-heading { display: flex; justify-content: space-between; gap: 15px; }
 .study-heading h3 { margin: 0 0 5px; font-size: 18px; }
 .study-heading p { margin: 0; color: #6b817d; font-size: 13px; }
-.inventory { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; }
-.inventory span { background: #f0f5f4; color: #506965; padding: 5px 8px; border-radius: 7px; font-size: 11px; font-weight: 700; }
 .status { color: #08786b; background: #e3f5f2; height: fit-content; padding: 5px 9px; border-radius: 999px; font-size: 11px; font-weight: 800; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
 .actions button { min-height: 38px; border-radius: 8px; padding: 0 13px; display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 700; }
 .secondary { background: #fff; color: #31524d; border: 1px solid #cddbd8; }
+.report-button { background: #f0b429; color: #3b2a00; border: 1px solid #f0b429; }
 .remote { background: #0b7065; color: white; border: 1px solid #0b7065; }
+.report-overlay { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 24px; background: rgba(13, 35, 32, .72); }
+.report-dialog { width: min(1180px, 100%); max-height: calc(100vh - 48px); overflow-y: auto; background: #fff; border-radius: 14px; box-shadow: 0 24px 70px rgba(0, 0, 0, .3); }
+.report-dialog-heading { position: sticky; top: 0; z-index: 1; display: flex; justify-content: space-between; gap: 20px; padding: 20px 24px; background: #fff; border-bottom: 1px solid #dce7e4; }
+.report-dialog-heading h2 { margin: 3px 0; font-size: 21px; }
+.report-dialog-heading p:last-child { margin: 0; color: #6b817d; font-size: 13px; }
+.icon-button { width: 40px; height: 40px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #cddbd8; border-radius: 8px; color: #31524d; background: #fff; }
+.report-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; padding: 24px; background: #f4f7f6; }
+.report-grid figure { margin: 0; overflow: hidden; border: 1px solid #dce7e4; border-radius: 10px; background: #fff; }
+.report-grid img { display: block; width: 100%; height: auto; background: #edf2f0; }
+.report-grid figcaption { padding: 10px 12px; color: #526b67; font-size: 12px; font-weight: 700; }
+.report-link { display: grid; place-items: center; min-height: 240px; margin: 16px; border-radius: 8px; text-decoration: none; }
 .empty { margin-top: 20px; background: white; border: 1px dashed #bdcfcb; border-radius: 14px; padding: 30px; text-align: center; color: #708681; }
 .login-shell { min-height: 100vh; display: grid; place-items: center; padding: 25px; background: radial-gradient(circle at top, #e0f2ee, #f5f7f6 55%); }
 .login-card { width: min(430px, 100%); background: white; border: 1px solid #dbe6e3; border-radius: 20px; padding: 38px; box-shadow: 0 24px 65px rgba(31, 71, 65, .13); }
@@ -68,5 +71,5 @@ header { height: 68px; padding: 0 max(24px, calc((100vw - 1120px) / 2)); display
 .login-card input:focus { border-color: #168477; box-shadow: 0 0 0 3px #d9f1ed; }
 .primary { width: 100%; margin: 22px 0 0; }
 .error { color: #ac2d25; font-weight: 650; font-size: 13px; }
-@media (max-width: 680px) { .hero { padding: 27px 22px; } .dashboard { padding: 25px 15px 60px; } .study-card { grid-template-columns: 1fr; } .study-time { border-right: 0; border-bottom: 1px solid #e3ecea; padding: 14px 20px; flex-direction: row; justify-content: space-between; } .study-main { padding: 19px; } .status { display: none; } }
+@media (max-width: 680px) { .hero { padding: 27px 22px; } .dashboard { padding: 25px 15px 60px; } .study-card { grid-template-columns: 1fr; } .study-time { border-right: 0; border-bottom: 1px solid #e3ecea; padding: 14px 20px; flex-direction: row; justify-content: space-between; } .study-main { padding: 19px; } .status { display: none; } .report-overlay { padding: 0; } .report-dialog { width: 100%; max-height: 100vh; min-height: 100vh; border-radius: 0; } .report-grid { grid-template-columns: 1fr; padding: 14px; } }
 

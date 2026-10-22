@@ -1,6 +1,6 @@
-import React, { FormEvent, useEffect, useState } from "react";
+import React, { FormEvent, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Activity, CalendarDays, FileImage, FileText, LogOut, MonitorUp, PlayCircle, Search } from "lucide-react";
+import { Activity, CalendarDays, FileImage, LogOut, MonitorUp, Search, X } from "lucide-react";
 import "./styles.css";
 
 type ClinicalFile = { id: number; kind: string; original_name: string; mime_type?: string; size_bytes: number; role?: string; embedded_path?: string };
@@ -58,8 +58,6 @@ function Login({ onLogin }: { onLogin: () => void }) {
   </main>;
 }
 
-const reportTypes = ["Corneal mapping summary", "Corneal thickness", "Tear-film analysis", "Pupillography"];
-
 // Open during the click so browsers do not block the tab after an authenticated fetch.
 async function openResource(load: () => Promise<string>) {
   const tab = window.open("about:blank", "_blank");
@@ -69,62 +67,72 @@ async function openResource(load: () => Promise<string>) {
   catch (error) { tab.close(); throw error; }
 }
 
-function FileButton({ file }: { file: ClinicalFile }) {
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const icon = file.kind === "video" ? <PlayCircle size={17}/> : file.kind.includes("image") ? <FileImage size={17}/> : <FileText size={17}/>;
-  const open = async () => {
-    setError(""); setBusy(true);
-    try {
-      await openResource(async () => {
-        const response = await api(`/api/files/${file.id}`);
-        const url = URL.createObjectURL(await response.blob());
-        window.setTimeout(() => URL.revokeObjectURL(url), 300_000);
-        return url;
-      });
-    } catch (error) { setError((error as Error).message); }
-    finally { setBusy(false); }
-  };
-  const label = file.kind === "report_image" ? file.role : file.kind === "report" ? "View report" : file.kind === "video" ? "Play video" : file.kind === "dicom" ? "Original DICOM" : "View image";
-  return <><button className="secondary" disabled={busy} title={file.embedded_path || file.original_name} onClick={open}>{icon}{busy ? "Opening…" : label}</button>{error && <span role="alert" className="error">{error}</span>}</>;
-}
-
 function StudyCard({ study }: { study: Study }) {
   const when = new Date(study.acquisition_datetime);
-  const [files, setFiles] = useState(study.files);
+  const reportsButtonRef = useRef<HTMLButtonElement>(null);
+  const [reportAssets, setReportAssets] = useState<{ file: ClinicalFile; url: string }[]>([]);
+  const [showReports, setShowReports] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const reports = files.filter(f => ["report", "report_image"].includes(f.kind));
-  const sources = files.filter(f => ["image", "video", "dicom"].includes(f.kind));
-  const selectReport = async (file: ClinicalFile, report_type: string) => {
+
+  const closeReports = () => {
+    setReportAssets([]); setShowReports(false);
+    window.requestAnimationFrame(() => reportsButtonRef.current?.focus());
+  };
+  const trapReportFocus = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Tab") return;
+    const controls = [...event.currentTarget.querySelectorAll<HTMLElement>("button:not([disabled]), a[href]")];
+    if (!controls.length) return;
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  };
+  useEffect(() => () => reportAssets.forEach(asset => URL.revokeObjectURL(asset.url)), [reportAssets]);
+  useEffect(() => {
+    if (!showReports) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") closeReports(); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  });
+
+  const openReports = async () => {
     setError(""); setBusy(true);
     try {
-      const updated = await (await api(`/api/files/${file.id}/report-type`, { method: "PATCH", body: JSON.stringify({ report_type: report_type || null }) })).json();
-      setFiles(current => current.map(item => item.id === updated.id ? updated : item));
+      const files: ClinicalFile[] = await (await api(`/api/studies/${study.id}/reports`)).json();
+      if (!files.length) throw new Error("No complete report views were found for this examination.");
+      const blobs = await Promise.all(files.map(async file => ({ file, blob: await (await api(`/api/files/${file.id}`)).blob() })));
+      setReportAssets(blobs.map(({ file, blob }) => ({ file, url: URL.createObjectURL(blob) })));
+      setShowReports(true);
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
+
   const remote = async () => {
     setError(""); setBusy(true);
     try {
       await openResource(async () => (await (await api(`/api/studies/${study.id}/remote-session`, { method: "POST" })).json()).url);
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
+
   return <article className="study-card">
     <div className="study-time"><strong>{when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</strong><span>{when.toLocaleDateString()}</span></div>
     <div className="study-main">
-      <div className="study-heading"><div><h3>{study.title}</h3><p>{study.machine.name}{study.machine.location ? ` · ${study.machine.location}` : ""}</p></div><span className="status">{reports.length ? `${reports.length} report${reports.length === 1 ? "" : "s"}` : "Report needed"}</span></div>
-      {!reports.length && <p className="muted">No report selected. Export the required report from Phoenix, or review source images below and select a matching report.</p>}
-      <div className="report-list">{reports.map(file => <div className="file-row" key={file.id}><FileButton file={file}/><span className="filename">{file.original_name}</span>{file.kind === "report_image" && <button className="text-button" disabled={busy} onClick={() => selectReport(file, "")}>Move to source images</button>}</div>)}</div>
+      <div className="study-heading"><div><h3>{study.title}</h3><p>{study.machine.name}{study.machine.location ? ` · ${study.machine.location}` : ""}</p></div><span className="status">Report</span></div>
       <div className="actions">
+        <button ref={reportsButtonRef} className="report-button" disabled={busy} onClick={openReports}><FileImage size={17}/>{busy ? "Opening reports…" : "Open reports"}</button>
         <button className="remote" disabled={busy || !study.machine.no_vnc_url} onClick={remote}><MonitorUp size={17}/>Open Phoenix / live software</button>
         <span className="muted">{study.machine.no_vnc_url ? "noVNC configured · connection unverified" : "Remote access not configured — use Remote access setup above."}</span>
       </div>
       {error && <p role="alert" className="error">{error}</p>}
-      <details className="source-files"><summary>Source images and original files ({sources.length})</summary>
-        <p className="muted">Select only complete report views matching Phoenix. Raw frames and previews stay here. Report selection does not verify clinical accuracy.</p>
-        {sources.map(file => <div className="file-row" key={file.id}><FileButton file={file}/><span className="filename">{file.embedded_path || file.original_name}</span>{file.kind === "image" && ["image/jpeg", "image/png"].includes(file.mime_type || "") && <select aria-label={`Report type for ${file.original_name}`} disabled={busy} value="" onChange={e => selectReport(file, e.target.value)}><option value="">Use as report…</option>{reportTypes.map(type => <option key={type}>{type}</option>)}</select>}</div>)}
-        <div className="inventory"><span>{study.dicom_objects_count} DICOM objects</span><span>{study.series_count} series</span><span>{study.image_entries_count} image entries</span><span>{study.unique_images_count} unique images</span></div>
-      </details>
+      {showReports && <div className="report-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeReports(); }}>
+        <section className="report-dialog" role="dialog" aria-modal="true" aria-labelledby={`reports-${study.id}`} onKeyDown={trapReportFocus}>
+          <div className="report-dialog-heading"><div><p className="eyebrow">Report gallery</p><h2 id={`reports-${study.id}`}>{study.title}</h2><p>{reportAssets.length} report view{reportAssets.length === 1 ? "" : "s"}</p></div><button className="icon-button" aria-label="Close reports" autoFocus onClick={closeReports}><X size={20}/></button></div>
+          <div className="report-grid">{reportAssets.map(({ file, url }, index) => <figure key={file.id}>
+            {file.mime_type?.startsWith("image/") ? <img src={url} alt={`${study.title} report ${index + 1}`} /> : <a className="secondary report-link" href={url} target="_blank" rel="noreferrer">Open report document</a>}
+            <figcaption>Report {index + 1}</figcaption>
+          </figure>)}</div>
+        </section>
+      </div>}
     </div>
   </article>;
 }
@@ -190,7 +198,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
       </section>
       {patient && <section className="patient">
         <div className="patient-header"><div className="avatar">{(patient.name ?? "P").slice(0, 1).toUpperCase()}</div><div><p className="eyebrow">Patient</p><h2>{patient.name || "Name unavailable"}</h2><p>Practo UID: <strong>{patient.practo_uid}</strong>{patient.date_of_birth ? ` · DOB ${new Date(patient.date_of_birth).toLocaleDateString()}` : ""}</p></div></div>
-        {patient.studies.length === 0 ? <div className="empty">No diagnostic tests have been collected yet.</div> : [...groupStudies(patient.studies)].map(([label, studies]) => <div className="date-group" key={label}><h2><CalendarDays size={19}/>{label}</h2>{studies.map(s => <StudyCard key={s.id} study={{ ...s, machine: machines[s.machine.id] || s.machine }}/>)}</div>)}
+        {patient.studies.length === 0 ? <div className="empty">No diagnostic tests have been collected yet.</div> : [...groupStudies(patient.studies)].map(([label, studies]) => <div className="date-group" key={label}><h2><CalendarDays size={19}/>{label}</h2>{studies.map(study => <StudyCard key={study.id} study={{ ...study, machine: machines[study.machine.id] || study.machine }}/>)}</div>)}
       </section>}
     </main>
   </>;
@@ -203,4 +211,3 @@ function App() {
 }
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode><App/></React.StrictMode>);
-

@@ -151,3 +151,47 @@ def test_report_selection_is_explicit_authenticated_and_reversible(client):
     restored = client.patch(path, headers=headers, json={"report_type": None}).json()
     assert restored["kind"] == "image"
     assert restored["role"] == "Scotopic images"
+
+
+def test_report_gallery_returns_composed_images_only_and_caps_at_four(client):
+    from datetime import datetime
+    from hashlib import sha256
+    from PIL import Image
+    from app.models import ClinicalFile, Machine, Patient, Study
+
+    with database.SessionLocal() as db:
+        study = Study(study_uid="report-gallery", patient=Patient(practo_uid="10042"),
+                      machine=Machine(code="REPORT-1", name="Sirius"), acquisition_datetime=datetime.now())
+        db.add(study)
+        db.flush()
+
+        for index in range(5):
+            relative_path = f"reports/composed-{index}.png"
+            path = main.settings.storage_root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (1024, 630), (index, 20, 30)).save(path)
+            content = path.read_bytes()
+            db.add(ClinicalFile(
+                study=study, kind="image", original_name=f"composed-{index}.cso",
+                relative_path=relative_path, mime_type="image/png", size_bytes=len(content),
+                sha256=sha256(content).hexdigest(), embedded_path=f"composed-{index}.cso",
+            ))
+
+        raw_path = main.settings.storage_root / "reports/raw-eye.png"
+        Image.new("RGB", (1024, 768), (10, 10, 10)).save(raw_path)
+        raw_content = raw_path.read_bytes()
+        db.add(ClinicalFile(
+            study=study, kind="image", original_name="raw-eye.raw", relative_path="reports/raw-eye.png",
+            mime_type="image/png", size_bytes=len(raw_content), sha256=sha256(raw_content).hexdigest(),
+            embedded_path="raw-eye.raw",
+        ))
+        db.commit()
+        study_id = study.id
+
+    path = f"/api/studies/{study_id}/reports"
+    assert client.get(path).status_code == 401
+    response = client.get(path, headers=auth_headers(client))
+
+    assert response.status_code == 200
+    assert len(response.json()) == 4
+    assert all(item["original_name"].startswith("composed-") for item in response.json())
