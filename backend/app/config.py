@@ -1,0 +1,28 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    database_url: str = "sqlite:///./hospital.db"
+    storage_root: Path = Path("./clinical-data")
+    doctor_username: str = "doctor"
+    doctor_password: str = "change-me"
+    jwt_secret: str = "development-only-change-me"
+    collector_api_key: str = "development-collector-key"
+    access_token_minutes: int = 480
+    max_upload_bytes: int = 2_000_000_000
+    allowed_origins: str = "http://localhost:5173,http://localhost:8080"
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @property
+    def origins(self) -> list[str]:
+        return [x.strip() for x in self.allowed_origins.split(",") if x.strip()]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+

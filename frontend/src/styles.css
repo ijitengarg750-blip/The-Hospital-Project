@@ -1,0 +1,54 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #18302d; background: #f4f7f6; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input { font: inherit; }
+button { cursor: pointer; }
+header { height: 68px; padding: 0 max(24px, calc((100vw - 1120px) / 2)); display: flex; align-items: center; justify-content: space-between; background: #fff; border-bottom: 1px solid #dce7e4; position: sticky; top: 0; z-index: 5; }
+.wordmark { display: flex; align-items: center; gap: 10px; color: #075e55; font-weight: 750; }
+.logout { border: 0; background: transparent; color: #566d69; display: flex; align-items: center; gap: 7px; }
+.dashboard { max-width: 1120px; margin: auto; padding: 42px 24px 80px; }
+.hero { background: linear-gradient(135deg, #0a645a, #0f8174); color: white; padding: 38px; border-radius: 20px; box-shadow: 0 18px 45px rgba(9, 87, 78, .18); }
+.hero h1 { font-size: clamp(28px, 4vw, 43px); margin: 4px 0 8px; letter-spacing: -.035em; }
+.hero > p:not(.eyebrow) { margin: 0; color: #cce8e4; }
+.eyebrow { text-transform: uppercase; letter-spacing: .13em; font-size: 11px; font-weight: 800; margin: 0; color: #138174; }
+.hero .eyebrow { color: #a9ded7; }
+.search { max-width: 690px; height: 58px; margin-top: 28px; background: white; border-radius: 12px; display: flex; align-items: center; padding-left: 17px; color: #7a918d; box-shadow: 0 9px 24px rgba(0,0,0,.12); }
+.search input { flex: 1; border: 0; outline: 0; padding: 0 14px; min-width: 80px; color: #18302d; }
+.search button, .primary { border: 0; background: #f0b429; color: #3b2a00; font-weight: 800; border-radius: 9px; height: 44px; padding: 0 22px; margin-right: 7px; }
+.search-error { color: #fff1f0 !important; }
+.patient { margin-top: 38px; }
+.patient-header { background: #fff; border: 1px solid #dce7e4; border-radius: 16px; padding: 24px; display: flex; gap: 16px; align-items: center; }
+.patient-header h2 { margin: 3px 0; }
+.patient-header p:last-child { margin: 0; color: #607571; }
+.avatar { width: 52px; height: 52px; border-radius: 50%; display: grid; place-items: center; background: #d9f1ed; color: #07665b; font-weight: 800; font-size: 21px; }
+.date-group { margin-top: 31px; }
+.date-group > h2 { font-size: 16px; display: flex; gap: 8px; align-items: center; color: #526b67; }
+.study-card { background: white; border: 1px solid #dce7e4; border-radius: 16px; display: grid; grid-template-columns: 125px 1fr; margin-top: 12px; overflow: hidden; }
+.study-time { padding: 24px; background: #f8fbfa; border-right: 1px solid #e3ecea; display: flex; flex-direction: column; gap: 5px; }
+.study-time strong { color: #0a665c; }
+.study-time span { color: #78908c; font-size: 12px; }
+.study-main { padding: 22px 24px; min-width: 0; }
+.study-heading { display: flex; justify-content: space-between; gap: 15px; }
+.study-heading h3 { margin: 0 0 5px; font-size: 18px; }
+.study-heading p { margin: 0; color: #6b817d; font-size: 13px; }
+.inventory { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; }
+.inventory span { background: #f0f5f4; color: #506965; padding: 5px 8px; border-radius: 7px; font-size: 11px; font-weight: 700; }
+.status { color: #08786b; background: #e3f5f2; height: fit-content; padding: 5px 9px; border-radius: 999px; font-size: 11px; font-weight: 800; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+.actions button { min-height: 38px; border-radius: 8px; padding: 0 13px; display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 700; }
+.secondary { background: #fff; color: #31524d; border: 1px solid #cddbd8; }
+.remote { background: #0b7065; color: white; border: 1px solid #0b7065; }
+.empty { margin-top: 20px; background: white; border: 1px dashed #bdcfcb; border-radius: 14px; padding: 30px; text-align: center; color: #708681; }
+.login-shell { min-height: 100vh; display: grid; place-items: center; padding: 25px; background: radial-gradient(circle at top, #e0f2ee, #f5f7f6 55%); }
+.login-card { width: min(430px, 100%); background: white; border: 1px solid #dbe6e3; border-radius: 20px; padding: 38px; box-shadow: 0 24px 65px rgba(31, 71, 65, .13); }
+.brand-mark { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 14px; color: white; background: #087267; margin-bottom: 25px; }
+.login-card h1 { margin: 5px 0 8px; letter-spacing: -.03em; }
+.muted { color: #6c817d; line-height: 1.5; }
+.login-card form { margin-top: 25px; }
+.login-card label { display: block; font-weight: 700; font-size: 13px; margin-top: 15px; }
+.login-card input { width: 100%; height: 46px; margin-top: 7px; border: 1px solid #cbd9d6; border-radius: 9px; padding: 0 12px; outline: none; }
+.login-card input:focus { border-color: #168477; box-shadow: 0 0 0 3px #d9f1ed; }
+.primary { width: 100%; margin: 22px 0 0; }
+.error { color: #ac2d25; font-weight: 650; font-size: 13px; }
+@media (max-width: 680px) { .hero { padding: 27px 22px; } .dashboard { padding: 25px 15px 60px; } .study-card { grid-template-columns: 1fr; } .study-time { border-right: 0; border-bottom: 1px solid #e3ecea; padding: 14px 20px; flex-direction: row; justify-content: space-between; } .study-main { padding: 19px; } .status { display: none; } }
+
