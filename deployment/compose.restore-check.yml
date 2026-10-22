@@ -1,0 +1,15 @@
+# Disposable restore target: no host ports, host folders or persistent volumes.
+services:
+  restore-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: verification
+      POSTGRES_USER: verification
+      POSTGRES_PASSWORD: disposable-restore-test-only
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verification -d verification"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

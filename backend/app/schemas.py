@@ -1,5 +1,7 @@
 from datetime import date, datetime
-from pydantic import BaseModel, ConfigDict
+from typing import Literal
+from urllib.parse import parse_qsl, urlsplit
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -7,12 +9,33 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class MachineCreate(BaseModel):
+class RemoteAccessUpdate(BaseModel):
+    no_vnc_url: str | None
+
+    @field_validator("no_vnc_url")
+    @classmethod
+    def safe_remote_url(cls, value):
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        url = urlsplit(value)
+        if url.scheme not in {"http", "https"} or not url.hostname or "\\" in value or any(c.isspace() for c in value):
+            raise ValueError("Use a complete HTTP or HTTPS noVNC URL")
+        if url.username or url.password or url.fragment or any(key.lower() in {"password", "passwd", "token", "username"} for key, _ in parse_qsl(url.query)):
+            raise ValueError("Enter credentials in noVNC, never in the URL")
+        return value
+
+
+class MachineCreate(RemoteAccessUpdate):
     code: str
     name: str
     modality: str | None = None
     location: str | None = None
     no_vnc_url: str | None = None
+
+
+class ReportTypeUpdate(BaseModel):
+    report_type: Literal["Corneal mapping summary", "Corneal thickness", "Tear-film analysis", "Pupillography"] | None
 
 
 class FileOut(BaseModel):

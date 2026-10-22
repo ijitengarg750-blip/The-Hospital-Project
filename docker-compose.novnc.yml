@@ -1,0 +1,8 @@
+# Optional gateway for ONE test PC. The PC must already run a VNC server.
+services:
+  novnc:
+    build: ./deployment/novnc
+    restart: unless-stopped
+    ports:
+      - "${NOVNC_BIND_ADDRESS:-127.0.0.1}:6080:6080"
+    command: ["${HOSPITAL_VNC_TARGET:-host.docker.internal:5900}"]

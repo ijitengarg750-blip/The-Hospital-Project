@@ -3,6 +3,24 @@
 body { margin: 0; min-width: 320px; min-height: 100vh; }
 button, input { font: inherit; }
 button { cursor: pointer; }
+button:disabled { cursor: default; opacity: .6; }
+button:focus-visible, summary:focus-visible, select:focus-visible { outline: 3px solid #bf8300; outline-offset: 3px; }
+.setup-toggle { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-radius: 8px; margin: 0 0 18px auto; }
+.remote-setup { background: white; border: 1px solid #dce7e4; padding: 24px; border-radius: 12px; margin-bottom: 24px; }
+.remote-setup h2 { margin-top: 0; }
+.remote-setup label { display: flex; flex-wrap: wrap; gap: 12px; font-weight: 700; }
+.remote-setup form + form { margin-top: 20px; }
+.remote-input { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.remote-input input { flex: 1; min-width: 180px; padding: 10px; border: 1px solid #cddbd8; border-radius: 6px; }
+.remote-input button { border-radius: 6px; padding: 10px; }
+.source-files { margin-top: 22px; border-top: 1px solid #e3ecea; padding-top: 15px; }
+.source-files summary { cursor: pointer; color: #526b67; font-size: 14px; }
+.file-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 0; border-bottom: 1px solid #edf2f0; }
+.file-row button, .file-row select { padding: 9px 12px; border-radius: 6px; max-width: 100%; }
+.file-row button { display: inline-flex; align-items: center; gap: 7px; }
+.filename { overflow-wrap: anywhere; font-size: 12px; color: #526b67; flex: 1; min-width: 120px; }
+.text-button { background: transparent; border: 0; color: #526b67; text-decoration: underline; font-size: 12px; }
+.actions > .muted { font-size: 12px; align-self: center; }
 header { height: 68px; padding: 0 max(24px, calc((100vw - 1120px) / 2)); display: flex; align-items: center; justify-content: space-between; background: #fff; border-bottom: 1px solid #dce7e4; position: sticky; top: 0; z-index: 5; }
 .wordmark { display: flex; align-items: center; gap: 10px; color: #075e55; font-weight: 750; }
 .logout { border: 0; background: transparent; color: #566d69; display: flex; align-items: center; gap: 7px; }

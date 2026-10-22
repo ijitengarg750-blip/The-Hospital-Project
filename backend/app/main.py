@@ -13,8 +13,9 @@ from sqlalchemy.orm import Session, selectinload
 from .config import get_settings
 from .database import Base, engine, get_db
 from .ingestion import ingest_upload
+from .dicom_import import role_for_member
 from .models import AuditLog, ClinicalFile, DicomObject, Machine, Patient, Study
-from .schemas import LoginRequest, MachineCreate, MachineOut, PatientOut, StudyInventoryOut
+from .schemas import FileOut, LoginRequest, MachineCreate, MachineOut, PatientOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
 from .security import authenticate, create_token, current_user, require_collector
 
 settings = get_settings()
@@ -57,6 +58,31 @@ def create_machine(payload: MachineCreate, user: str = Depends(current_user), db
 @app.get("/api/machines", response_model=list[MachineOut])
 def list_machines(_: str = Depends(current_user), db: Session = Depends(get_db)):
     return list(db.scalars(select(Machine).order_by(Machine.name)))
+
+
+@app.patch("/api/machines/{machine_id}/remote-access", response_model=MachineOut)
+def update_remote_access(machine_id: int, payload: RemoteAccessUpdate, user: str = Depends(current_user), db: Session = Depends(get_db)):
+    machine = db.get(Machine, machine_id)
+    if not machine:
+        raise HTTPException(404, "Machine not found")
+    machine.no_vnc_url = payload.no_vnc_url
+    db.add(AuditLog(username=user, action="machine.remote.configure", resource=machine.code))
+    db.commit()
+    return machine
+
+
+@app.patch("/api/files/{file_id}/report-type", response_model=FileOut)
+def update_report_type(file_id: int, payload: ReportTypeUpdate, user: str = Depends(current_user), db: Session = Depends(get_db)):
+    item = db.get(ClinicalFile, file_id)
+    if not item:
+        raise HTTPException(404, "File not found")
+    if item.kind not in {"image", "report_image"} or item.mime_type not in {"image/jpeg", "image/png"}:
+        raise HTTPException(422, "Only JPEG or PNG images can be selected as report images")
+    item.kind = "report_image" if payload.report_type else "image"
+    item.role = payload.report_type or (role_for_member(item.embedded_path, "JPEG" if item.mime_type == "image/jpeg" else "PNG") if item.embedded_path else "Machine export")
+    db.add(AuditLog(username=user, action="file.report.select", resource=f"file:{file_id};type:{payload.report_type or 'source'}"))
+    db.commit()
+    return item
 
 
 @app.get("/api/patients/{practo_uid}", response_model=PatientOut)
@@ -115,11 +141,15 @@ def study_inventory(study_id: int, user: str = Depends(current_user), db: Sessio
 @app.post("/api/studies/{study_id}/remote-session")
 def remote_session(study_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
     study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.machine)))
-    if not study or not study.machine.no_vnc_url:
+    if not study or not study.machine.active or not study.machine.no_vnc_url:
         raise HTTPException(404, "Remote access is not configured for this machine")
+    try:
+        remote_url = RemoteAccessUpdate(no_vnc_url=study.machine.no_vnc_url).no_vnc_url
+    except ValueError:
+        raise HTTPException(422, "Update this machine's noVNC URL in remote access setup")
     db.add(AuditLog(username=user, action="remote.open", resource=f"study:{study_id};machine:{study.machine.code}"))
     db.commit()
-    return {"url": study.machine.no_vnc_url}
+    return {"url": remote_url}
 
 
 @app.post("/api/collector/upload", dependencies=[Depends(require_collector)])

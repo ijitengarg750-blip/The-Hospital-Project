@@ -128,6 +128,28 @@ def test_original_dicom_content_hash_matches_the_source(database, tmp_path):
     assert sha256(stored.read_bytes()).hexdigest() == record.sha256
 
 
+def test_partial_private_archive_is_rejected_without_study_or_stored_files(database, tmp_path):
+    from pydicom import dcmread
+
+    db, storage = database
+    source = tmp_path / "incomplete.dcm"
+    write_dicom(source)
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("Scotopic/eye.jpg", b"\xff\xd8\xff" + b"image fixture" * 200)
+    dataset = dcmread(source)
+    dataset.add_new((0x7001, 0x1099), "OB", archive.getvalue())
+    dataset.save_as(source, enforce_file_format=True)
+    source.write_bytes(source.read_bytes()[:-100])
+
+    with pytest.raises(zipfile.BadZipFile):
+        ingestion.ingest_upload(db, "TEST-1", source, "incomplete.dcm")
+
+    assert not list(db.scalars(select(Study)))
+    assert not list(storage.rglob("*.dcm"))
+    assert not list(db.scalars(select(ClinicalFile)))
+
+
 def test_archive_skips_posix_and_windows_traversal_names():
     blob = BytesIO()
     with zipfile.ZipFile(blob, "w") as archive:

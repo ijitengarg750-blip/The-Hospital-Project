@@ -103,3 +103,51 @@ def test_collector_rejects_unknown_machine_before_dicom_ingestion(client):
 
     assert response.status_code == 422
     assert response.json()["detail"] == "Unknown machine code: UNKNOWN"
+
+
+def auth_headers(client):
+    response = client.post("/api/auth/login", json={"username": "test-doctor", "password": "test-password"})
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def test_remote_configuration_requires_login_and_persists(client):
+    headers = auth_headers(client)
+    machine = client.post("/api/machines", headers=headers, json={"code": "TEST-1", "name": "Sirius"}).json()
+    path = f"/api/machines/{machine['id']}/remote-access"
+    payload = {"no_vnc_url": "http://localhost:6080/vnc.html?autoconnect=true&view_only=true"}
+    assert client.patch(path, json=payload).status_code == 401
+    assert client.patch(path, headers=headers, json=payload).status_code == 200
+    assert client.get("/api/machines", headers=headers).json()[0]["no_vnc_url"] == payload["no_vnc_url"]
+    assert client.patch(path, headers=headers, json={"no_vnc_url": None}).json()["no_vnc_url"] is None
+
+
+@pytest.mark.parametrize("url", ["javascript:alert(1)", "//example.com/vnc.html", "http://u:p@example.com", "http://example.com/?password=secret", "http://example.com/#password=secret"])
+def test_remote_urls_reject_scripts_and_credentials(client, url):
+    headers = auth_headers(client)
+    assert client.post("/api/machines", headers=headers, json={"code": "BAD", "name": "Bad", "no_vnc_url": url}).status_code == 422
+
+
+def test_report_selection_is_explicit_authenticated_and_reversible(client):
+    from datetime import datetime
+    from app.models import ClinicalFile, Machine, Patient, Study
+
+    with database.SessionLocal() as db:
+        study = Study(study_uid="report-selection", patient=Patient(practo_uid="10042"),
+                      machine=Machine(code="REPORT-1", name="Sirius"), acquisition_datetime=datetime.now())
+        image = ClinicalFile(study=study, kind="image", original_name="eye.jpg", relative_path="eye.jpg",
+                             mime_type="image/jpeg", size_bytes=3, sha256="a" * 64, embedded_path="Scotopic/eye.jpg")
+        db.add(image)
+        db.commit()
+        image_id = image.id
+    path = f"/api/files/{image_id}/report-type"
+    payload = {"report_type": "Corneal mapping summary"}
+    assert client.patch(path, json=payload).status_code == 401
+    headers = auth_headers(client)
+    marked = client.patch(path, headers=headers, json=payload)
+    assert marked.status_code == 200
+    assert marked.json()["kind"] == "report_image"
+    assert marked.json()["role"] == "Corneal mapping summary"
+    assert client.patch(path, headers=headers, json={"report_type": "Unverified guess"}).status_code == 422
+    restored = client.patch(path, headers=headers, json={"report_type": None}).json()
+    assert restored["kind"] == "image"
+    assert restored["role"] == "Scotopic images"
