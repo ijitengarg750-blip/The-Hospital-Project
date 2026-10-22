@@ -119,7 +119,7 @@ def view_file(file_id: int, user: str = Depends(current_user), db: Session = Dep
     return FileResponse(path, media_type=item.mime_type or "application/octet-stream", filename=item.original_name, content_disposition_type="inline")
 
 
-def _is_composed_report_image(item: ClinicalFile) -> bool:
+def _is_automatic_report_image(study: Study, item: ClinicalFile) -> bool:
     if item.kind != "image" or item.mime_type not in {"image/jpeg", "image/png"}:
         return False
     path = (settings.storage_root / item.relative_path).resolve()
@@ -128,7 +128,13 @@ def _is_composed_report_image(item: ClinicalFile) -> bool:
     try:
         with Image.open(path) as image:
             width, height = image.size
-        return width >= 1000 and width / height >= 1.5
+        if width >= 1000 and width / height >= 1.5:
+            return True
+        return (
+            study.title.casefold() in {"pupillography", "tear film analysis"}
+            and (width, height) == (800, 600)
+            and item.role == "Image in .cso"
+        )
     except (OSError, UnidentifiedImageError):
         return False
 
@@ -139,7 +145,7 @@ def study_reports(study_id: int, user: str = Depends(current_user), db: Session 
     if not study:
         raise HTTPException(404, "Study not found")
     reports = [item for item in study.files if item.kind in {"report", "report_image"}]
-    reports.extend(item for item in study.files if item not in reports and _is_composed_report_image(item))
+    reports.extend(item for item in study.files if item not in reports and _is_automatic_report_image(study, item))
     reports.sort(key=lambda item: (item.kind not in {"report", "report_image"}, item.id))
     db.add(AuditLog(username=user, action="report.gallery.view", resource=f"study:{study_id}"))
     db.commit()

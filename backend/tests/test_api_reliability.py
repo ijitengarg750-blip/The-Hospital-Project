@@ -195,3 +195,46 @@ def test_report_gallery_returns_composed_images_only_and_caps_at_four(client):
     assert response.status_code == 200
     assert len(response.json()) == 4
     assert all(item["original_name"].startswith("composed-") for item in response.json())
+
+
+def test_report_gallery_includes_pupillography_and_tear_film_cso_views(client):
+    from datetime import datetime
+    from hashlib import sha256
+    from PIL import Image
+    from app.models import ClinicalFile, Machine, Patient, Study
+
+    with database.SessionLocal() as db:
+        patient = Patient(practo_uid="10043")
+        machine = Machine(code="REPORT-2", name="Sirius")
+        studies = {
+            title: Study(study_uid=f"report-gallery-{index}", patient=patient, machine=machine,
+                         title=title, acquisition_datetime=datetime.now())
+            for index, title in enumerate(("Pupillography", "Tear Film Analysis", "Meibography"))
+        }
+        db.add_all(studies.values())
+        db.flush()
+
+        for study_index, (title, study) in enumerate(studies.items()):
+            for image_index, size in enumerate(((800, 600), (800, 600), (640, 480))):
+                relative_path = f"reports/{study_index}-{image_index}.png"
+                path = main.settings.storage_root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", size, (study_index * 30, image_index * 30, 20)).save(path)
+                content = path.read_bytes()
+                db.add(ClinicalFile(
+                    study=study, kind="image", original_name=f"{study_index}-{image_index}.cso",
+                    relative_path=relative_path, mime_type="image/png", size_bytes=len(content),
+                    sha256=sha256(content).hexdigest(), role="Image in .cso",
+                    embedded_path=f"{study_index}-{image_index}.cso",
+                ))
+        db.commit()
+        study_ids = {title: study.id for title, study in studies.items()}
+
+    headers = auth_headers(client)
+    pupil = client.get(f"/api/studies/{study_ids['Pupillography']}/reports", headers=headers).json()
+    tear_film = client.get(f"/api/studies/{study_ids['Tear Film Analysis']}/reports", headers=headers).json()
+    meibography = client.get(f"/api/studies/{study_ids['Meibography']}/reports", headers=headers).json()
+
+    assert len(pupil) == 2
+    assert len(tear_film) == 2
+    assert meibography == []
