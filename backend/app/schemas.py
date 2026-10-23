@@ -49,6 +49,14 @@ class FileOut(BaseModel):
     embedded_path: str | None
 
 
+class PhoenixReportOut(BaseModel):
+    object_id: int
+    label: str
+    laterality: str | None
+    mime_type: Literal["image/png"] = "image/png"
+    url: str
+
+
 class MachineOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int

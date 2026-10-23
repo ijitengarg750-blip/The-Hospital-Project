@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./clinical-data:/clinical-data
+      - ./clinical-data:/clinical-data:ro
     depends_on:
       db:
         condition: service_healthy

@@ -6,7 +6,7 @@ import tempfile
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
@@ -150,6 +150,77 @@ def study_reports(study_id: int, user: str = Depends(current_user), db: Session 
     db.add(AuditLog(username=user, action="report.gallery.view", resource=f"study:{study_id}"))
     db.commit()
     return reports[:4]
+
+
+def _stored_path(item: ClinicalFile) -> Path | None:
+    path = (settings.storage_root / item.relative_path).resolve()
+    if settings.storage_root.resolve() not in path.parents or not path.is_file():
+        return None
+    return path
+
+
+def _eye_name(laterality: str | None) -> str:
+    if (laterality or "").upper() == "L":
+        return "Left eye (OS)"
+    if (laterality or "").upper() == "R":
+        return "Right eye (OD)"
+    return "Eye examination"
+
+
+@app.get("/api/studies/{study_id}/phoenix-reports", response_model=list[PhoenixReportOut])
+def phoenix_report_manifest(study_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+    study = db.scalar(
+        select(Study)
+        .where(Study.id == study_id)
+        .options(selectinload(Study.dicom_objects).selectinload(DicomObject.original_file))
+    )
+    if not study:
+        raise HTTPException(404, "Study not found")
+    reports = []
+    for item in sorted(study.dicom_objects, key=lambda value: (value.series_number or "", value.id)):
+        path = _stored_path(item.original_file)
+        if path and dicom_has_phoenix_report(path, study.title):
+            reports.append(PhoenixReportOut(
+                object_id=item.id,
+                label=_eye_name(item.laterality),
+                laterality=item.laterality,
+                url=f"/api/studies/{study.id}/phoenix-reports/{item.id}.png",
+            ))
+    db.add(AuditLog(username=user, action="phoenix.report.list", resource=f"study:{study_id}"))
+    db.commit()
+    return reports
+
+
+@app.get("/api/studies/{study_id}/phoenix-reports/{object_id}.png")
+def phoenix_report_image(study_id: int, object_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+    study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.patient)))
+    item = db.scalar(
+        select(DicomObject)
+        .where(DicomObject.id == object_id, DicomObject.study_id == study_id)
+        .options(selectinload(DicomObject.original_file))
+    )
+    if not study or not item:
+        raise HTTPException(404, "Phoenix report source not found")
+    path = _stored_path(item.original_file)
+    if not path:
+        raise HTTPException(404, "Stored DICOM source is unavailable")
+    acquired = study.acquisition_datetime.strftime("%m/%d/%Y %I:%M %p").replace(" 0", " ")
+    dob = study.patient.date_of_birth
+    birthdate = f"{dob.month}/{dob.day}/{dob.year}" if dob else ""
+    try:
+        content = render_dicom_report(
+            path, study.title, patient_name=study.patient.name or "Name unavailable",
+            patient_id=study.patient.practo_uid, acquired=acquired, birthdate=birthdate,
+        )
+    except PhoenixReportError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    db.add(AuditLog(username=user, action="phoenix.report.view", resource=f"study:{study_id};object:{object_id}"))
+    db.commit()
+    return Response(
+        content=content,
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="phoenix-{study_id}-{object_id}.png"'},
+    )
 
 
 @app.get("/api/studies/{study_id}/inventory", response_model=StudyInventoryOut)

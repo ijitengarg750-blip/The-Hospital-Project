@@ -238,3 +238,59 @@ def test_report_gallery_includes_pupillography_and_tear_film_cso_views(client):
     assert len(pupil) == 2
     assert len(tear_film) == 2
     assert meibography == []
+
+
+def test_phoenix_report_manifest_and_image_are_authenticated(client, monkeypatch):
+    from datetime import datetime
+    from hashlib import sha256
+    from io import BytesIO
+    from PIL import Image
+    from app.models import ClinicalFile, DicomObject, Machine, Patient, Study
+
+    with database.SessionLocal() as db:
+        study = Study(
+            study_uid="phoenix-pupil", patient=Patient(practo_uid="10044", name="Test Patient"),
+            machine=Machine(code="REPORT-3", name="Sirius"), title="Pupillography",
+            acquisition_datetime=datetime(2025, 12, 23, 14, 18),
+        )
+        relative_path = "original/source.dcm"
+        source = main.settings.storage_root / relative_path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"DICOM fixture")
+        original = ClinicalFile(
+            study=study, kind="dicom", original_name="source.dcm", relative_path=relative_path,
+            mime_type="application/dicom", size_bytes=source.stat().st_size,
+            sha256=sha256(source.read_bytes()).hexdigest(), role="Original DICOM object",
+        )
+        dicom = DicomObject(
+            study=study, original_file=original, sop_uid="phoenix-pupil-object", laterality="L",
+            zip_status="readable",
+        )
+        db.add(dicom)
+        db.commit()
+        study_id, object_id = study.id, dicom.id
+
+    output = BytesIO()
+    Image.new("RGB", (1600, 936), "white").save(output, "PNG")
+    monkeypatch.setattr(main, "dicom_has_phoenix_report", lambda path, title: True)
+    monkeypatch.setattr(main, "render_dicom_report", lambda *args, **kwargs: output.getvalue())
+
+    manifest_path = f"/api/studies/{study_id}/phoenix-reports"
+    image_path = f"{manifest_path}/{object_id}.png"
+    assert client.get(manifest_path).status_code == 401
+    assert client.get(image_path).status_code == 401
+
+    headers = auth_headers(client)
+    manifest = client.get(manifest_path, headers=headers)
+    assert manifest.status_code == 200
+    assert manifest.json() == [{
+        "object_id": object_id,
+        "label": "Left eye (OS)",
+        "laterality": "L",
+        "mime_type": "image/png",
+        "url": image_path,
+    }]
+    image = client.get(image_path, headers=headers)
+    assert image.status_code == 200
+    assert image.headers["content-type"] == "image/png"
+    assert Image.open(BytesIO(image.content)).size == (1600, 936)
