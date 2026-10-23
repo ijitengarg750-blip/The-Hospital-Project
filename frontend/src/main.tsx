@@ -4,9 +4,17 @@ import { Activity, CalendarDays, FileImage, LogOut, MonitorUp, Search, X } from 
 import "./styles.css";
 
 type ClinicalFile = { id: number; kind: string; original_name: string; mime_type?: string; size_bytes: number; role?: string; embedded_path?: string };
+type PhoenixReport = { object_id: number; label: string; laterality?: string; mime_type: "image/png"; url: string };
+type ReportAsset = { key: string; label: string; mimeType?: string; url: string };
 type Machine = { id: number; code: string; name: string; modality?: string; location?: string; no_vnc_url?: string };
 type Study = { id: number; study_uid: string; title: string; acquisition_datetime: string; status: string; machine: Machine; files: ClinicalFile[]; dicom_objects_count: number; series_count: number; embedded_entries_count: number; image_entries_count: number; unique_images_count: number; pixel_data_objects_count: number };
 type Patient = { practo_uid: string; name?: string; date_of_birth?: string; studies: Study[] };
+
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
 
 const api = async (path: string, options: RequestInit = {}) => {
   const token = localStorage.getItem("hospital-token");
@@ -21,7 +29,7 @@ const api = async (path: string, options: RequestInit = {}) => {
       if (typeof problem === "string") detail = problem;
       else if (Array.isArray(problem)) detail = problem.map(item => item.msg || "Invalid input").join("; ");
     } catch { /* ignore */ }
-    throw new Error(detail);
+    throw new ApiError(detail, response.status);
   }
   return response;
 };
@@ -70,7 +78,7 @@ async function openResource(load: () => Promise<string>) {
 function StudyCard({ study }: { study: Study }) {
   const when = new Date(study.acquisition_datetime);
   const reportsButtonRef = useRef<HTMLButtonElement>(null);
-  const [reportAssets, setReportAssets] = useState<{ file: ClinicalFile; url: string }[]>([]);
+  const [reportAssets, setReportAssets] = useState<ReportAsset[]>([]);
   const [showReports, setShowReports] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -99,10 +107,23 @@ function StudyCard({ study }: { study: Study }) {
   const openReports = async () => {
     setError(""); setBusy(true);
     try {
+      const phoenix: PhoenixReport[] = await (await api(`/api/studies/${study.id}/phoenix-reports`)).json();
+      if (phoenix.length) {
+        const blobs = await Promise.all(phoenix.map(async report => ({ report, blob: await (await api(report.url)).blob() })));
+        setReportAssets(blobs.map(({ report, blob }) => ({
+          key: `phoenix-${report.object_id}`, label: report.label, mimeType: report.mime_type,
+          url: URL.createObjectURL(blob),
+        })));
+        setShowReports(true);
+        return;
+      }
       const files: ClinicalFile[] = await (await api(`/api/studies/${study.id}/reports`)).json();
       if (!files.length) throw new Error("No complete report views were found for this examination.");
       const blobs = await Promise.all(files.map(async file => ({ file, blob: await (await api(`/api/files/${file.id}`)).blob() })));
-      setReportAssets(blobs.map(({ file, blob }) => ({ file, url: URL.createObjectURL(blob) })));
+      setReportAssets(blobs.map(({ file, blob }, index) => ({
+        key: `file-${file.id}`, label: file.role || `Report ${index + 1}`, mimeType: file.mime_type,
+        url: URL.createObjectURL(blob),
+      })));
       setShowReports(true);
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
@@ -127,9 +148,9 @@ function StudyCard({ study }: { study: Study }) {
       {showReports && <div className="report-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeReports(); }}>
         <section className="report-dialog" role="dialog" aria-modal="true" aria-labelledby={`reports-${study.id}`} onKeyDown={trapReportFocus}>
           <div className="report-dialog-heading"><div><p className="eyebrow">Report gallery</p><h2 id={`reports-${study.id}`}>{study.title}</h2><p>{reportAssets.length} report view{reportAssets.length === 1 ? "" : "s"}</p></div><button className="icon-button" aria-label="Close reports" autoFocus onClick={closeReports}><X size={20}/></button></div>
-          <div className="report-grid">{reportAssets.map(({ file, url }, index) => <figure key={file.id}>
-            {file.mime_type?.startsWith("image/") ? <img src={url} alt={`${study.title} report ${index + 1}`} /> : <a className="secondary report-link" href={url} target="_blank" rel="noreferrer">Open report document</a>}
-            <figcaption>Report {index + 1}</figcaption>
+          <div className="report-grid">{reportAssets.map(({ key, label, mimeType, url }, index) => <figure key={key}>
+            {mimeType?.startsWith("image/") ? <img src={url} alt={`${study.title}, ${label}`} /> : <a className="secondary report-link" href={url} target="_blank" rel="noreferrer">Open report document</a>}
+            <figcaption>{label || `Report ${index + 1}`}</figcaption>
           </figure>)}</div>
         </section>
       </div>}
@@ -184,7 +205,13 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const search = async (event: FormEvent) => {
     event.preventDefault(); setError(""); setPatient(null); setBusy(true);
     try { setPatient(await (await api(`/api/patients/${encodeURIComponent(uid.trim())}`)).json()); }
-    catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        onLogout();
+        return;
+      }
+      setError((e as Error).message);
+    } finally { setBusy(false); }
   };
 
   return <>
