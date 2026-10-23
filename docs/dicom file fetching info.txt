@@ -1,0 +1,454 @@
+# Hospital Diagnostic Dashboard Project — DICOM Investigation Summary
+
+Investigation period: October 2026 Machine investigated: CSO Sirius Ophthalmic Diagnostic System Main objective: Retrieve historical patient examinations from the hospital's diagnostic machines and display them in a centralized, browser-based dashboard without depending entirely on the original machine software.
+
+This summary covers what we investigated, our experiments, the results we obtained, the tools we developed, the problems encountered, and the next steps.
+
+## 1. Original problem
+
+The hospital uses multiple ophthalmic diagnostic machines, each with its own software and patient examination database.
+
+Our larger project aims to create a dashboard where doctors can:
+
+- Search for a patient using their hospital UID.
+- View historical diagnostic examinations from different machines.
+- Open reports, images, videos and available measurements.
+- Access the original machine software remotely when necessary.
+
+Our investigation focused on whether DICOM files could provide access to examination data independently of the manufacturer's software.
+
+## 2. Discovering the DICOM files
+
+We initially found multiple `.dcm` files on the computer.
+
+The main questions were whether the files belonged to one patient or several patients, and whether their contents could be decoded.
+
+We installed Python's `pydicom` library and inspected their metadata.
+
+Our first script confirmed that a single patient could have multiple examinations, with multiple DICOM files belonging to each examination.
+
+### Metadata successfully recovered
+
+For one examined record, we retrieved:
+
+| Field             | Result                                        |
+| ----------------- | --------------------------------------------- |
+| Patient ID        | 53601                                         |
+| Study date        | 03 February 2025                              |
+| Study time        | 14:55:06                                      |
+| Study description | Pupillography                                 |
+| Modality          | OP                                            |
+| Manufacturer      | C.S.O. Costruzione Strumenti Oftalmici S.r.l. |
+| Machine model     | Sirius                                        |
+| SOP Class         | Raw Data Storage                              |
+
+We also recovered patient names, birth dates, sex, StudyInstanceUIDs and SeriesInstanceUIDs. These identifying fields must be protected.
+
+Discovery: DICOM metadata allows us to associate files with specific source-system patient IDs, examinations and imaging series.
+
+## 3. Why MicroDicom couldn't display some files
+
+When we opened the files in MicroDicom, some files didn't display any images.
+
+Python showed:
+
+```
+SOP Class: Raw Data Storage
+Transfer Syntax: Implicit VR Little Endian
+Rows: None
+Columns: None
+Pixel Data Present: False
+```
+
+Initially, we suspected incomplete files or unsupported image compression.
+
+Further investigation revealed that these were DICOM Raw Data Storage objects, rather than conventional DICOM image objects.
+
+We discovered three private attributes:
+
+| Private tag   | Content              |
+| ------------- | -------------------- |
+| `(7001,0010)` | `CSO`                |
+| `(7001,1098)` | XML-like metadata    |
+| `(7001,1099)` | Large binary payload |
+
+The `(7001,1099)` attribute accounted for approximately 99.83% of one examined DICOM file.
+
+The file was not simply empty or missing standard image pixels; it contained substantial vendor-specific data.
+
+## 4. Major breakthrough — ZIP archives inside DICOM
+
+By inspecting the binary signatures, we discovered:
+
+```
+00 50 4B 03 04 ...
+```
+
+The `50 4B 03 04` signature identifies a ZIP archive header.
+
+We used Python's `zipfile` library and confirmed:
+
+```
+ZIP valid: True
+```
+
+CSO Sirius was storing an embedded ZIP archive inside a private DICOM attribute.
+
+This was the most important discovery of the investigation because it provided a way to access examination data that MicroDicom could not display.
+
+### Example ZIP contents
+
+```
+DICOM Raw Data Storage
+│
+└── Embedded ZIP
+    ├── ExamInfo.xml
+    ├── examination.cal
+    ├── examination.cso
+    ├── examination.pup
+    ├── examination.tmb
+    │
+    ├── Dynamic/
+    │   ├── 000
+    │   ├── 008
+    │   ├── 016
+    │   └── ...080
+    │
+    ├── Mesopic/
+    │   └── 000
+    ├── Photopic/
+    │   └── 000
+    └── Scotopic/
+        └── 000
+```
+
+This example archive contained 19 entries.
+
+## 5. Successfully recovering real examination images
+
+We inspected the headers of the ZIP entries.
+
+Several files started with:
+
+```
+FF D8 FF E0 ... JFIF
+```
+
+This is the signature of a standard JPEG image.
+
+We extracted and displayed the images using Python, Pillow and Matplotlib.
+
+Dynamic images — successfully decoded.
+
+Mesopic images — successfully decoded.
+
+Photopic images — successfully decoded.
+
+Scotopic images — successfully decoded.
+
+The displayed images showed the patient's eye, with visible differences in pupil size under different illumination conditions.
+
+We initially recovered 14 JPEG images from one example Pupillography DICOM file.
+
+We subsequently found that `.cso` and `.tmb` files also contained standard JPEG data in that archive.
+
+Conclusion: Some CSO Sirius examination images can be retrieved and displayed independently of the original proprietary software.
+
+However, obtaining the images does not mean we have recovered the complete clinical examination or its validated numerical results.
+
+## 6. Examination metadata from ExamInfo.xml
+
+We parsed `ExamInfo.xml` and identified these fields:
+
+| Field                              | Purpose                           |
+| ---------------------------------- | --------------------------------- |
+| Version                            | Metadata format version           |
+| ExamType                           | Examination type                  |
+| Laterality                         | Examined eye                      |
+| SentSOPClassUID                    | DICOM object class                |
+| SentSOPInstanceUIDCreationDateTime | Object creation timestamp         |
+| DeviceSN                           | Device serial number              |
+| DeviceID                           | Device identifier                 |
+| ScanType                           | Scan classification               |
+| SurfaceType                        | Surface classification            |
+| AcquisitionDateTime                | Examination acquisition timestamp |
+| HwRevision                         | Hardware revision                 |
+| LiveVersion                        | Software version                  |
+| AcqUserName                        | Acquisition operator              |
+
+This provided additional metadata that may improve examination grouping.
+
+We also noticed that DICOM StudyDate and export-related timestamps are not necessarily the same. Therefore, historical examinations should be ordered using validated clinical acquisition dates, rather than Windows file modification dates or timestamps inferred from UIDs.
+
+## 7. Complete folder analysis
+
+After successfully decoding one DICOM file, we developed scripts to analyze the entire folder.
+
+The user-provided CSV and JSON reports produced the following results:
+
+Final DICOM inventory
+
+# 21
+
+DICOM files
+
+# 2
+
+Patient IDs
+
+# 5
+
+Studies
+
+# 21
+
+Series
+
+# 623
+
+ZIP entries
+
+# 0
+
+Parse failures
+
+All 21 DICOM files were successfully parsed, and embedded ZIP archives were identified in all 21.
+
+### Patient-wise analysis
+
+| Patient ID | Studies | DICOM files | Embedded JPEGs |
+| ---------- | ------- | ----------- | -------------- |
+| 53601      | 2       | 8           | 198            |
+| 58117      | 3       | 13          | 314            |
+| Total      | 5       | 21          | 512            |
+
+### Study-wise breakdown
+
+| Study date  | Examination                 | DICOM files | JPEGs |
+| ----------- | --------------------------- | ----------- | ----- |
+| 03 Feb 2025 | Scheimpflug Corneal Mapping | 6           | 170   |
+| 03 Feb 2025 | Pupillography               | 2           | 28    |
+| 11 Dec 2025 | Scheimpflug Corneal Mapping | 6           | 169   |
+| 11 Dec 2025 | Tear Film Analysis          | 2           | 4     |
+| 11 Dec 2025 | Scheimpflug Corneal Mapping | 5           | 141   |
+
+Two corneal-mapping studies occurred on the same date for one patient and had different StudyInstanceUIDs. We therefore treated them as separate studies rather than merging them automatically.
+
+These results demonstrate that historical examinations can be organized by patient and study using DICOM metadata.
+
+### Breakdown of the 623 embedded ZIP entries
+
+Embedded ZIP contents
+
+Counts from the folder audit
+
+0150300450600JPEGUnknown / proprietaryXML/textPNGNested ZIP
+
+The audit identified:
+
+- 512 JPEG images.
+- 17 PNG images.
+- 23 XML/text candidates.
+- 69 unknown or proprietary entries.
+- 2 nested ZIP archives.
+
+This gives 529 potentially displayable JPEG/PNG entries, although not all are unique clinical images.
+
+The audit also identified 2 DICOM objects with standard Pixel Data associated with video-capable Tear Film Analysis examinations.
+
+## 8. Further investigation into proprietary data
+
+We investigated several file extensions found inside the ZIP archives.
+
+| Extension | Finding             | Interpretation                      |
+| --------- | ------------------- | ----------------------------------- |
+| `.cso`    | Sometimes JPEG/PNG  | Image content, exact purpose varies |
+| `.tmb`    | JPEG                | Likely thumbnail/preview            |
+| `.pup`    | Proprietary binary  | Possibly pupil measurements         |
+| `.cal`    | Small binary        | Potential calibration information   |
+| `.rng`    | Proprietary binary  | Not decoded                         |
+| `.scc`    | Proprietary binary  | Not decoded                         |
+| `.dat`    | Proprietary binary  | Not decoded                         |
+| `.sce`    | Proprietary binary  | Not decoded                         |
+| `.trm`    | Nested ZIP archive  | Contents not fully investigated     |
+| `.mes`    | Text-like candidate | Meaning requires validation         |
+
+Important: We have not reliably decoded the clinical measurements inside these proprietary formats.
+
+For example, even if `.pup` contains floating-point values, we cannot safely identify them as pupil diameters without understanding the field structure, units, calibration and processing rules.
+
+We planned to compare these files against measurements displayed in the original Sirius software.
+
+## 9. Scripts and tools we developed
+
+During the investigation, we created several Python tools.
+
+| Script                          | Purpose                                           | Status                    |
+| ------------------------------- | ------------------------------------------------- | ------------------------- |
+| DICOM metadata inspector        | Read patient and study metadata                   | Worked                    |
+| ZIP extractor/inspector         | Detect and inspect embedded ZIP                   | Worked                    |
+| Image extraction script         | Display JPEG images                               | Worked                    |
+| `dicom_folder_audit.py`         | Inventory patients, studies and files             | Worked on 21 files        |
+| `dicom_patient_zip_analysis.py` | Audit embedded ZIP entries patient-wise           | Generated CSV reports     |
+| `build_dicom_gallery.py`        | Build an offline patient-wise image gallery       | Generated HTML gallery    |
+| `dicom_clinical_gallery_v2.py`  | Attempt better grouping and completeness tracking | Further validation needed |
+
+The gallery generator successfully produced:
+
+```
+Gallery ready: ...\output\index.html
+Patient IDs: 2
+Studies: 5
+Errors: 0
+```
+
+Therefore, we established a working route from DICOM files to a locally viewable HTML patient-history gallery.
+
+## 10. The main gallery problem we encountered
+
+Although the gallery could group studies correctly, the images within each study were mixed together without clinically meaningful organization.
+
+A corneal-mapping study might display eye photographs, scan frames, report-like graphics, thumbnails, and images from different acquisition times in the same continuous grid.
+
+This makes the viewer difficult for doctors to interpret.
+
+We concluded that grouping only by PatientID and StudyInstanceUID is insufficient.
+
+The improved hierarchy should be:
+
+Patient
+
+Study
+
+Examination and date
+
+Series / acquisition
+
+Laterality, acquisition time, SOP object
+
+Ordered scan frames
+
+Eye photographs
+
+Maps / report candidates
+
+Thumbnails / previews
+
+Metadata / measurements
+
+Unsupported data
+
+## 11. Pattern discovery for better image classification
+
+Using the embedded ZIP inventory, we discovered repeatable filename patterns.
+
+### Scheimpflug Corneal Mapping
+
+Across 17 corneal-mapping DICOM objects, each contained a sequence of 25 JPEG images named with suffixes:
+
+```
+.00
+.01
+.02
+...
+.24
+```
+
+That gives 425 ordered scan images.
+
+Instead of treating them as unrelated photographs, we can display each 25-image set as one navigable sequence.
+
+We also identified repeated accompanying files:
+
+- `.irs` — additional image.
+- `.top` — additional image, potentially topography-related.
+- `.cso` and `.raw` — images that may include composite maps or report graphics.
+- `.tmb` — probable thumbnail.
+
+The suspected clinical roles of `.irs`, `.top`, `.cso` and `.raw` still require visual comparison with Sirius.
+
+### Pupillography
+
+Its embedded ZIP already provides meaningful categories:
+
+- `Dynamic/`
+- `Mesopic/`
+- `Photopic/`
+- `Scotopic/`
+
+These can be used directly for gallery grouping, with dynamic images maintained as an ordered sequence.
+
+### Tear Film Analysis
+
+This examination has a different structure:
+
+- `.cso`
+- `.tmb`
+- `.mes`
+- `.trm`
+- `ExamInfo.xml`
+- Standard DICOM Pixel Data in relevant objects.
+
+The `.trm` nested ZIPs and DICOM video playback remain areas for further investigation.
+
+## 12. Problems and limitations encountered
+
+| Problem                                            | What we learned                                                                |
+| -------------------------------------------------- | ------------------------------------------------------------------------------ |
+| MicroDicom couldn't display Raw Data Storage files | These files contained proprietary ZIP payloads rather than normal DICOM images |
+| Patient examinations appeared mixed together       | Must group using PatientID, StudyInstanceUID and series/object metadata        |
+| Different image types appeared together            | Need examination-specific classification rules                                 |
+| Some files had misleading extensions               | Identify formats from content signatures, not filenames alone                  |
+| Proprietary measurements remained unreadable       | Require format analysis and validation against Sirius                          |
+| Some download links failed                         | We attempted Python and ZIP downloads                                          |
+| `PermissionError` writing `patients.csv`           | Likely an Excel file lock or destination permissions                           |
+| Full clinical history was uncertain                | DICOM exports may not contain every examination stored by the machine          |
+
+One Windows error occurred because the audit script could not overwrite `patients.csv`. Closing the CSV in Excel or using a fresh output folder was the recommended fix. It was not evidence that the DICOM files were too numerous.
+
+## 13. What we've achieved versus what remains
+
+| Capability                                | Status                              |
+| ----------------------------------------- | ----------------------------------- |
+| Read DICOM metadata                       | &#x20;Working                       |
+| Identify patients                         | &#x20;Working for source PatientIDs |
+| Group studies                             | &#x20;Working                       |
+| Detect private ZIP archives               | &#x20;Working                       |
+| Extract JPEG/PNG images                   | &#x20;Working                       |
+| Build basic HTML patient gallery          | &#x20;Working                       |
+| Classify images by clinical purpose       | &#x20;Partially investigated        |
+| Render DICOM videos in browser            | &#x20;Not completed                 |
+| Decode proprietary numerical measurements | &#x20;Not completed                 |
+| Match machine IDs with hospital UID       | &#x20;Not validated                 |
+| Verify completeness against Sirius        | &#x20;Not completed                 |
+| Automatic collection from the machine     | &#x20;Not verified                  |
+
+## 14. What we should do next
+
+The immediate goal should be a clinically understandable patient examination viewer, rather than simply displaying every available image.
+
+I recommend this order:
+
+1. Refine image classification. Apply the confirmed naming patterns and separate sequences, thumbnails, photographs and unverified report/map candidates.
+2. Validate with Sirius. Compare one complete examination in the original software against the reconstructed gallery. Identify missing images, maps, graphs or numerical measurements.
+3. Investigate proprietary measurements. Prioritize `.pup`, `.mes`, `.trm`, `.dat` and other files based on their actual contribution to the examination.
+4. Build the doctor-facing history viewer. Include examination navigation, correctly grouped images, supported videos, available metadata and clear notices for unsupported data.
+5. Integrate automatic collection. Verify whether the machine creates or exports DICOM automatically, and then establish a reliable path to the hospital server.
+
+We should also verify the mapping between the Sirius PatientID and the hospital's Practo UID before combining records from different diagnostic machines.
+
+## Final conclusion
+
+Our original question was:
+
+Can we recover historical examination data from the CSO Sirius machine without relying entirely on its original software?
+
+We have demonstrated that the answer is yes, for a meaningful subset of the data.
+
+We successfully parsed 21 DICOM files belonging to 2 source patient IDs and 5 studies, discovered 623 embedded ZIP entries, identified 529 JPEG/PNG entries, and built an initial offline HTML gallery.
+
+The most significant technical discovery was that CSO Sirius stores standard image data inside private DICOM Raw Data Storage attributes as embedded ZIP archives.
+
+However, we have not yet reproduced the complete examination as doctors see it in Sirius. Numerical measurements, some report graphics, video handling, and proprietary formats require further investigation.
+
+The project has progressed from identifying opaque `.dcm` files to building a patient-wise examination viewer. The next milestone is turning the extracted data into a properly grouped, clinically validated presentation that doctors can actually use.

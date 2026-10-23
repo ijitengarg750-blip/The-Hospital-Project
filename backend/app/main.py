@@ -16,12 +16,15 @@ from .database import Base, engine, get_db
 from .ingestion import ingest_upload
 from .dicom_import import role_for_member
 from .models import AuditLog, ClinicalFile, DicomObject, Machine, Patient, Study
-from .schemas import FileOut, LoginRequest, MachineCreate, MachineOut, PatientOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
+from .phoenix_reports import PhoenixReportError, dicom_has_phoenix_report, render_dicom_report
+from .remote_sessions import router as remote_sessions_router
+from .schemas import FileOut, LoginRequest, MachineCreate, MachineOut, PatientOut, PhoenixReportOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
 from .security import authenticate, create_token, current_user, require_collector
 
 settings = get_settings()
 app = FastAPI(title="Hospital Diagnostic Dashboard API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(remote_sessions_router)
 
 
 @app.on_event("startup")
