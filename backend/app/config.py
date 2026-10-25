@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     access_token_minutes: int = 480
     max_upload_bytes: int = 2_000_000_000
     allowed_origins: str = "http://localhost:5173,http://localhost:8080"
+    vnc_targets_file: Path | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

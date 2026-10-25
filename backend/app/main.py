@@ -18,6 +18,7 @@ from .dicom_import import role_for_member
 from .models import AuditLog, ClinicalFile, DicomObject, Machine, Patient, Study
 from .phoenix_reports import PhoenixReportError, dicom_has_phoenix_report, render_dicom_report
 from .remote_sessions import router as remote_sessions_router
+from .vnc_gateway import router as vnc_gateway_router
 from .schemas import FileOut, LoginRequest, MachineCreate, MachineOut, PatientOut, PhoenixReportOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
 from .security import authenticate, create_token, current_user, require_collector
 
@@ -25,6 +26,7 @@ settings = get_settings()
 app = FastAPI(title="Hospital Diagnostic Dashboard API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(remote_sessions_router)
+app.include_router(vnc_gateway_router)
 
 
 @app.on_event("startup")

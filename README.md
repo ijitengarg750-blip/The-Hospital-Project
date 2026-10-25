@@ -69,7 +69,7 @@ Do not expose port 8080 directly to the public internet. Use it on the hospital 
 
 ## Register the first machine
 
-Sign in to get a token, then create the Sirius machine. Replace the server address, password and noVNC URL:
+Sign in to get a token, then create the Sirius machine. Replace the server address and dashboard password:
 
 ```bash
 TOKEN=$(curl -s http://SERVER_IP:8080/api/auth/login \
@@ -83,12 +83,11 @@ curl http://SERVER_IP:8080/api/machines \
     "code":"SIRIUS-ROOM-2",
     "name":"CSO Sirius",
     "modality":"Pupillography",
-    "location":"Diagnostic Room 2",
-    "no_vnc_url":"http://SERVER_IP:6080/vnc.html?autoconnect=true"
+    "location":"Diagnostic Room 2"
   }'
 ```
 
-No VNC password is stored in PostgreSQL or included in this project. The doctor enters it in the noVNC page. Restrict VNC to the hospital LAN and use a different strong password per machine.
+The optional one-click remote-access gateway keeps VNC credentials in root-readable server files rather than PostgreSQL, URLs, or browser JavaScript. Use the runnable [two-laptop test guide](deployment/two-laptop-remote-access-test.md) for its TLS, firewall, machine-provisioning, and test-password setup. Do not expose VNC or the gateway directly to the public internet.
 
 ## Build the Windows collector
 
@@ -198,7 +197,8 @@ The database tells the dashboard which files belong to which patients; the direc
 - Image classification uses filenames/types and may leave items as general images.
 - "Other images / possible report or preview" remains intentionally uncertain until its clinical purpose is verified against Sirius.
 - Browser video appears only when an extracted browser-compatible format is available.
-- noVNC credentials are entered at the noVNC page rather than stored in the dashboard database.
+- The one-click gateway brokers VNC credentials server-side; classic VNC traffic still requires an isolated LAN/VLAN and host firewall because its upstream protocol is not encrypted.
+- Automatic Windows secure-desktop unlock/sign-in is not yet implemented. `LogonUserW` validation is not an interactive sign-in mechanism; see the [legacy compatibility audit](docs/windows-legacy-compatibility-audit.md).
 - Before routine clinical use, the hospital must approve user access, retention, backup, LAN/VPN exposure and audit policy.
 
 ## Development checks

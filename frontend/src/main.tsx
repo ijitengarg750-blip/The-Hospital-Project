@@ -1,6 +1,7 @@
 import React, { FormEvent, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Activity, CalendarDays, FileImage, LogOut, MonitorUp, Search, X } from "lucide-react";
+import RFB from "@novnc/novnc";
+import { Activity, CalendarDays, FileImage, LogOut, MessageSquare, MonitorUp, Search, X } from "lucide-react";
 import "./styles.css";
 
 type ClinicalFile = { id: number; kind: string; original_name: string; mime_type?: string; size_bytes: number; role?: string; embedded_path?: string };
@@ -9,6 +10,8 @@ type ReportAsset = { key: string; label: string; mimeType?: string; url: string 
 type Machine = { id: number; code: string; name: string; modality?: string; location?: string; no_vnc_url?: string };
 type Study = { id: number; study_uid: string; title: string; acquisition_datetime: string; status: string; machine: Machine; files: ClinicalFile[]; dicom_objects_count: number; series_count: number; embedded_entries_count: number; image_entries_count: number; unique_images_count: number; pixel_data_objects_count: number };
 type Patient = { practo_uid: string; name?: string; date_of_birth?: string; studies: Study[] };
+type RemoteSession = { id: string; status: "requested" | "ready" | "connected" | "ended" | "expired" | "failed"; machine_state: string; end_reason?: string };
+type RemoteMessage = { id: number; sender: "doctor" | "local_operator"; body: string; created_at: string };
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -66,13 +69,80 @@ function Login({ onLogin }: { onLogin: () => void }) {
   </main>;
 }
 
-// Open during the click so browsers do not block the tab after an authenticated fetch.
-async function openResource(load: () => Promise<string>) {
-  const tab = window.open("about:blank", "_blank");
-  if (!tab) throw new Error("Allow pop-ups for this dashboard, then try again.");
-  tab.opener = null;
-  try { tab.location.replace(await load()); }
-  catch (error) { tab.close(); throw error; }
+const waitForReady = async (sessionId: string): Promise<RemoteSession> => {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const session: RemoteSession = await (await api(`/api/remote-sessions/${sessionId}`)).json();
+    if (session.status === "ready") return session;
+    if (["ended", "expired", "failed"].includes(session.status)) throw new Error(`Remote session ${session.status}.`);
+    await new Promise(resolve => window.setTimeout(resolve, 750));
+  }
+  throw new Error("The diagnostic PC did not become ready within one minute.");
+}
+
+function RemoteViewer({ sessionId, ticket, websocketPath, onClose }: { sessionId: string; ticket: string; websocketPath: string; onClose: () => void }) {
+  const screen = useRef<HTMLDivElement>(null);
+  const rfb = useRef<RFB | null>(null);
+  const [status, setStatus] = useState("Connecting securely…");
+  const [messages, setMessages] = useState<RemoteMessage[]>([]);
+  const [body, setBody] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!screen.current) return;
+    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    const client = new RFB(screen.current, `${scheme}://${window.location.host}${websocketPath}`, {
+      shared: true,
+      wsProtocols: [`hospital-ticket.${ticket}`],
+    });
+    rfb.current = client;
+    client.scaleViewport = true;
+    client.resizeSession = false;
+    client.addEventListener("connect", () => { setStatus("Connected"); client.focus(); });
+    client.addEventListener("disconnect", () => setStatus("Disconnected"));
+    client.addEventListener("securityfailure", () => setError("The remote gateway rejected the connection."));
+    return () => client.disconnect();
+  }, [sessionId, ticket, websocketPath]);
+
+  useEffect(() => {
+    let active = true;
+    let after = 0;
+    const poll = async () => {
+      while (active) {
+        try {
+          const incoming: RemoteMessage[] = await (await api(`/api/remote-sessions/${sessionId}/messages?after=${after}`)).json();
+          if (incoming.length) {
+            after = incoming[incoming.length - 1].id;
+            setMessages(current => [...current, ...incoming]);
+          }
+          const session: RemoteSession = await (await api(`/api/remote-sessions/${sessionId}`)).json();
+          if (["ended", "expired", "failed"].includes(session.status)) { setStatus(`Ended (${session.end_reason || session.status})`); rfb.current?.disconnect(); return; }
+        } catch (e) { if (active) setError((e as Error).message); }
+        await new Promise(resolve => window.setTimeout(resolve, 1500));
+      }
+    };
+    void poll();
+    return () => { active = false; };
+  }, [sessionId]);
+
+  const sendMessage = async (event: FormEvent) => {
+    event.preventDefault();
+    const message = body.trim();
+    if (!message) return;
+    try {
+      await api(`/api/remote-sessions/${sessionId}/messages`, { method: "POST", body: JSON.stringify({ body: message }) });
+      setBody("");
+    } catch (e) { setError((e as Error).message); }
+  };
+  const end = async () => {
+    try { await api(`/api/remote-sessions/${sessionId}`, { method: "DELETE" }); }
+    finally { rfb.current?.disconnect(); onClose(); }
+  };
+
+  return <div className="remote-viewer" role="dialog" aria-modal="true" aria-label="Remote diagnostic desktop">
+    <header className="remote-toolbar"><strong>Live diagnostic desktop</strong><span role="status">{status}</span><button onClick={() => rfb.current?.sendCtrlAltDel()}>Ctrl+Alt+Del</button><button className="danger" onClick={end}>End session</button></header>
+    <div className="remote-workspace"><div ref={screen} className="remote-screen" tabIndex={0}/><aside className="remote-chat"><h2><MessageSquare size={17}/>Messages</h2><div className="message-list" aria-live="polite">{messages.map(message => <p key={message.id} className={message.sender}><strong>{message.sender === "doctor" ? "Doctor" : "Diagnostic PC"}</strong>{message.body}</p>)}</div><form onSubmit={sendMessage}><label htmlFor="remote-message">Message local operator</label><textarea id="remote-message" maxLength={500} value={body} onChange={event => setBody(event.target.value)}/><button>Send</button></form>{error && <p role="alert" className="error">{error}</p>}</aside></div>
+  </div>;
 }
 
 function StudyCard({ study }: { study: Study }) {
@@ -82,6 +152,7 @@ function StudyCard({ study }: { study: Study }) {
   const [showReports, setShowReports] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [viewer, setViewer] = useState<{ sessionId: string; ticket: string; websocketPath: string } | null>(null);
 
   const closeReports = () => {
     setReportAssets([]); setShowReports(false);
@@ -131,7 +202,10 @@ function StudyCard({ study }: { study: Study }) {
   const remote = async () => {
     setError(""); setBusy(true);
     try {
-      await openResource(async () => (await (await api(`/api/studies/${study.id}/remote-session`, { method: "POST" })).json()).url);
+      const created = await (await api(`/api/studies/${study.id}/remote-sessions`, { method: "POST" })).json();
+      await waitForReady(created.session.id);
+      const access = await (await api(`/api/remote-sessions/${created.session.id}/viewer-tickets`, { method: "POST", body: JSON.stringify({ connection_grant: created.connection_grant }) })).json();
+      setViewer({ sessionId: created.session.id, ticket: access.viewer_ticket, websocketPath: access.websocket_path });
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
 
@@ -141,8 +215,8 @@ function StudyCard({ study }: { study: Study }) {
       <div className="study-heading"><div><h3>{study.title}</h3><p>{study.machine.name}{study.machine.location ? ` · ${study.machine.location}` : ""}</p></div><span className="status">Report</span></div>
       <div className="actions">
         <button ref={reportsButtonRef} className="report-button" disabled={busy} onClick={openReports}><FileImage size={17}/>{busy ? "Opening reports…" : "Open reports"}</button>
-        <button className="remote" disabled={busy || !study.machine.no_vnc_url} onClick={remote}><MonitorUp size={17}/>Open Phoenix / live software</button>
-        <span className="muted">{study.machine.no_vnc_url ? "noVNC configured · connection unverified" : "Remote access not configured — use Remote access setup above."}</span>
+        <button className="remote" disabled={busy} onClick={remote}><MonitorUp size={17}/>{busy ? "Preparing secure session…" : "Open Phoenix / live software"}</button>
+        <span className="muted">Secure gateway · automatic VNC authentication</span>
       </div>
       {error && <p role="alert" className="error">{error}</p>}
       {showReports && <div className="report-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeReports(); }}>
@@ -154,6 +228,7 @@ function StudyCard({ study }: { study: Study }) {
           </figure>)}</div>
         </section>
       </div>}
+      {viewer && <RemoteViewer {...viewer} onClose={() => setViewer(null)}/>}
     </div>
   </article>;
 }
@@ -176,7 +251,7 @@ function RemoteSetup({ onUpdate }: { onUpdate: (machine: Machine) => void }) {
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
   return <section className="remote-setup" aria-label="Remote access setup">
-    <h2>Remote access setup</h2><p className="muted">Enter the noVNC gateway URL for the diagnostic PC. The PC needs a VNC server and a reachable noVNC gateway. Enter the VNC password only in noVNC.</p>
+    <h2>Legacy remote URL</h2><p className="muted">Kept for existing deployments. New one-click sessions use the machine agent and the server-side VNC target/secret configuration; no password is sent to this page.</p>
     {machines.map(machine => <form key={machine.id} onSubmit={event => save(event, machine)}><label htmlFor={`remote-${machine.id}`}>{machine.name} · {machine.code}<span className="muted">{machine.no_vnc_url ? "Configured · connection unverified" : "Not configured"}</span></label><div className="remote-input"><input id={`remote-${machine.id}`} name="url" type="url" defaultValue={machine.no_vnc_url || ""} placeholder="http://gateway:6080/vnc.html?view_only=true"/><button className="secondary" disabled={busy}>Save URL</button></div></form>)}
     {busy && <p role="status">Working…</p>}{!busy && !machines.length && !error && <p>No machines registered yet.</p>}
     {error && <p role="alert" className="error">{error}</p>}{message && <p role="status">{message}</p>}

@@ -7,9 +7,9 @@ import secrets
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, select
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column, selectinload
 
@@ -20,6 +20,7 @@ from .security import current_user
 router = APIRouter(prefix="/api")
 SESSION_LIFETIME = timedelta(minutes=5)
 AGENT_ONLINE_WINDOW = timedelta(seconds=60)
+VIEWER_TICKET_LIFETIME = timedelta(seconds=30)
 MachineState = Literal["unlocked", "locked", "signed_out", "booting", "busy", "unavailable"]
 
 
@@ -50,6 +51,15 @@ class RemoteSession(Base):
     connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     end_reason: Mapped[str | None] = mapped_column(String(50))
+
+
+class RemoteMessage(Base):
+    __tablename__ = "remote_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("remote_sessions.id"), index=True)
+    sender: Mapped[str] = mapped_column(String(30))
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AgentCredentialOut(BaseModel):
@@ -89,6 +99,23 @@ class SessionCreatedOut(BaseModel):
 
 class ConnectRequest(BaseModel):
     connection_grant: str
+
+
+class ViewerTicketOut(BaseModel):
+    viewer_ticket: str
+    websocket_path: str
+
+
+class MessageIn(BaseModel):
+    body: str = Field(min_length=1, max_length=500)
+
+
+class MessageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    sender: Literal["doctor", "local_operator"]
+    body: str
+    created_at: datetime
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -132,6 +159,31 @@ def _agent_session(session_id: str, agent: MachineAgent, db: Session) -> RemoteS
     session = db.get(RemoteSession, session_id)
     if not session or session.machine_id != agent.machine_id:
         raise HTTPException(404, "Remote session not found")
+    return session
+
+
+def _active_session(session: RemoteSession) -> RemoteSession:
+    if not session.active_slot or session.status in {"ended", "expired", "failed"}:
+        raise HTTPException(409, "Remote session has ended")
+    return session
+
+
+def consume_viewer_ticket(db: Session, session_id: str, ticket: str) -> RemoteSession | None:
+    """Atomically consume the short-lived ticket before any VNC connection is opened."""
+    now = utcnow()
+    session = db.scalar(select(RemoteSession).where(RemoteSession.id == session_id).with_for_update())
+    if (
+        not session
+        or session.status != "ready"
+        or not session.active_slot
+        or not session.grant_used_at
+        or now - _as_utc(session.grant_used_at) > VIEWER_TICKET_LIFETIME
+        or not hmac.compare_digest(session.connection_grant_hash, sha256(ticket.encode()).hexdigest())
+    ):
+        return None
+    session.connection_grant_hash = sha256(secrets.token_bytes(32)).hexdigest()
+    session.status = "connected"
+    session.connected_at = now
     return session
 
 
@@ -256,6 +308,36 @@ def connect_remote_session(
     return session
 
 
+@router.post("/remote-sessions/{session_id}/viewer-tickets", response_model=ViewerTicketOut, status_code=201)
+def issue_viewer_ticket(
+    session_id: str,
+    payload: ConnectRequest,
+    user: str = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    session = db.scalar(
+        select(RemoteSession)
+        .where(RemoteSession.id == session_id, RemoteSession.doctor_username == user)
+        .with_for_update()
+    )
+    if not session:
+        raise HTTPException(404, "Remote session not found")
+    now = utcnow()
+    if _expire(session, now):
+        db.commit()
+        raise HTTPException(410, "Remote session expired")
+    if session.status != "ready" or session.grant_used_at:
+        raise HTTPException(409, "Remote session is not ready for a viewer")
+    if not hmac.compare_digest(session.connection_grant_hash, sha256(payload.connection_grant.encode()).hexdigest()):
+        raise HTTPException(401, "Invalid connection grant")
+    ticket = secrets.token_urlsafe(32)
+    session.connection_grant_hash = sha256(ticket.encode()).hexdigest()
+    session.grant_used_at = now
+    db.add(AuditLog(username=user, action="remote.viewer.ticket.issue", resource=f"session:{session.id}"))
+    db.commit()
+    return {"viewer_ticket": ticket, "websocket_path": f"/api/remote-sessions/{session.id}/rfb"}
+
+
 @router.delete("/remote-sessions/{session_id}", response_model=SessionOut)
 def end_remote_session(
     session_id: str,
@@ -326,4 +408,58 @@ def agent_end_session(
         db.add(AuditLog(username=f"agent:{agent.machine_id}", action="remote.session.end", resource=f"session:{session.id};reason:local_operator"))
         db.commit()
     return session
+
+
+def _create_message(db: Session, session: RemoteSession, sender: str, audit_username: str, body: str) -> RemoteMessage:
+    _active_session(session)
+    message = RemoteMessage(session_id=session.id, sender=sender, body=body.strip())
+    if not message.body:
+        raise HTTPException(422, "Message cannot be blank")
+    db.add(message)
+    db.add(AuditLog(username=audit_username, action="remote.session.message", resource=f"session:{session.id};sender:{sender}"))
+    db.commit()
+    db.refresh(message)
+    return message
+
+
+@router.get("/remote-sessions/{session_id}/messages", response_model=list[MessageOut])
+def doctor_messages(
+    session_id: str,
+    after: int = Query(default=0, ge=0),
+    user: str = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    _doctor_session(session_id, user, db)
+    return list(db.scalars(select(RemoteMessage).where(RemoteMessage.session_id == session_id, RemoteMessage.id > after).order_by(RemoteMessage.id).limit(100)))
+
+
+@router.post("/remote-sessions/{session_id}/messages", response_model=MessageOut, status_code=201)
+def doctor_message(
+    session_id: str,
+    payload: MessageIn,
+    user: str = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    return _create_message(db, _doctor_session(session_id, user, db), "doctor", user, payload.body)
+
+
+@router.get("/agent/remote-sessions/{session_id}/messages", response_model=list[MessageOut])
+def agent_messages(
+    session_id: str,
+    after: int = Query(default=0, ge=0),
+    agent: MachineAgent = Depends(_agent_for_request),
+    db: Session = Depends(get_db),
+):
+    _agent_session(session_id, agent, db)
+    return list(db.scalars(select(RemoteMessage).where(RemoteMessage.session_id == session_id, RemoteMessage.id > after).order_by(RemoteMessage.id).limit(100)))
+
+
+@router.post("/agent/remote-sessions/{session_id}/messages", response_model=MessageOut, status_code=201)
+def agent_message(
+    session_id: str,
+    payload: MessageIn,
+    agent: MachineAgent = Depends(_agent_for_request),
+    db: Session = Depends(get_db),
+):
+    return _create_message(db, _agent_session(session_id, agent, db), "local_operator", f"agent:{agent.machine_id}", payload.body)
 

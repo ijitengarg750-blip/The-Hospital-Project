@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import json
+import socket
+import struct
+import threading
 
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from app import database, ingestion, main, security
+from app import database, ingestion, main, security, vnc_gateway
 from app.config import Settings
 from app.database import Base, build_engine
 from app.models import Machine, Patient, Study
@@ -31,8 +35,11 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "settings", settings)
     monkeypatch.setattr(ingestion, "get_settings", lambda: settings)
     monkeypatch.setattr(security, "get_settings", lambda: settings)
+    monkeypatch.setattr(vnc_gateway, "get_settings", lambda: settings)
     Base.metadata.create_all(engine)
     with TestClient(main.app) as test_client:
+        test_client.test_settings = settings
+        test_client.test_tmp_path = tmp_path
         yield test_client
     Base.metadata.drop_all(engine)
 
@@ -197,4 +204,150 @@ def test_busy_offline_expired_and_terminated_sessions_fail_closed(client):
     )
     assert expired.status_code == 410
     assert client.get(f"/api/remote-sessions/{session_id}", headers=doctor).json()["status"] == "expired"
+
+
+def test_viewer_ticket_is_short_lived_single_use_and_contains_no_vnc_secret(client):
+    from app.remote_sessions import consume_viewer_ticket
+
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+    client.post("/api/agent/heartbeat", headers=agent_headers, json={"state": "unlocked"})
+    doctor = doctor_headers(client)
+    created = client.post(f"/api/studies/{study_id}/remote-sessions", headers=doctor).json()
+    session_id = created["session"]["id"]
+    client.post(f"/api/agent/remote-sessions/{session_id}/ready", headers=agent_headers)
+
+    issued = client.post(
+        f"/api/remote-sessions/{session_id}/viewer-tickets",
+        headers=doctor,
+        json={"connection_grant": created["connection_grant"]},
+    )
+    assert issued.status_code == 201
+    ticket = issued.json()["viewer_ticket"]
+    assert issued.json()["websocket_path"] == f"/api/remote-sessions/{session_id}/rfb"
+    assert "password" not in issued.text.casefold()
+
+    with database.SessionLocal() as db:
+        claimed = consume_viewer_ticket(db, session_id, ticket)
+        assert claimed.machine_id == machine_id
+        db.commit()
+    with database.SessionLocal() as db:
+        assert consume_viewer_ticket(db, session_id, ticket) is None
+
+
+def test_doctor_and_local_operator_can_exchange_messages_until_session_ends(client):
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+    client.post("/api/agent/heartbeat", headers=agent_headers, json={"state": "locked"})
+    doctor = doctor_headers(client)
+    created = client.post(f"/api/studies/{study_id}/remote-sessions", headers=doctor).json()
+    session_id = created["session"]["id"]
+    client.post(f"/api/agent/remote-sessions/{session_id}/ready", headers=agent_headers)
+
+    doctor_message = client.post(
+        f"/api/remote-sessions/{session_id}/messages",
+        headers=doctor,
+        json={"body": "Please finish the current scan."},
+    )
+    assert doctor_message.status_code == 201
+    assert doctor_message.json()["sender"] == "doctor"
+    assert client.post(
+        f"/api/agent/remote-sessions/{session_id}/messages",
+        headers=agent_headers,
+        json={"body": "Ready now."},
+    ).status_code == 201
+
+    messages = client.get(f"/api/remote-sessions/{session_id}/messages", headers=doctor).json()
+    assert [(item["sender"], item["body"]) for item in messages] == [
+        ("doctor", "Please finish the current scan."),
+        ("local_operator", "Ready now."),
+    ]
+    assert client.get(
+        f"/api/agent/remote-sessions/{session_id}/messages?after={messages[0]['id']}",
+        headers=agent_headers,
+    ).json()[0]["body"] == "Ready now."
+    assert client.post(
+        f"/api/remote-sessions/{session_id}/messages",
+        headers=doctor,
+        json={"body": "x" * 501},
+    ).status_code == 422
+
+    client.post(f"/api/agent/remote-sessions/{session_id}/end", headers=agent_headers)
+    assert client.post(
+        f"/api/remote-sessions/{session_id}/messages",
+        headers=doctor,
+        json={"body": "This must not be accepted."},
+    ).status_code == 409
+
+
+def test_websocket_gateway_authenticates_to_vnc_before_exposing_the_rfb_stream(client):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    challenge = bytes.fromhex("00112233445566778899aabbccddeeff")
+    observed = {}
+
+    def fake_vnc_server():
+        connection, _ = listener.accept()
+        with connection:
+            connection.sendall(b"RFB 003.008\n")
+            observed["version"] = connection.recv(12)
+            connection.sendall(b"\x01\x02")
+            observed["security"] = connection.recv(1)
+            connection.sendall(challenge)
+            observed["response"] = connection.recv(16)
+            connection.sendall(b"\x00\x00\x00\x00")
+            observed["shared"] = connection.recv(1)
+            connection.sendall(
+                struct.pack(">HH", 1, 1)
+                + bytes.fromhex("2018000100ff00ff00ff100800000000")
+                + struct.pack(">I", 4)
+                + b"test"
+            )
+
+    server_thread = threading.Thread(target=fake_vnc_server, daemon=True)
+    server_thread.start()
+    password_file = client.test_tmp_path / "vnc-password"
+    password_file.write_text("correct\n", encoding="utf-8")
+    targets_file = client.test_tmp_path / "vnc-targets.json"
+    targets_file.write_text(json.dumps({"SIRIUS-1": {"host": "127.0.0.1", "port": port, "password_file": str(password_file)}}), encoding="utf-8")
+    client.test_settings.vnc_targets_file = targets_file
+
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+    client.post("/api/agent/heartbeat", headers=agent_headers, json={"state": "unlocked"})
+    doctor = doctor_headers(client)
+    created = client.post(f"/api/studies/{study_id}/remote-sessions", headers=doctor).json()
+    session_id = created["session"]["id"]
+    client.post(f"/api/agent/remote-sessions/{session_id}/ready", headers=agent_headers)
+    access = client.post(
+        f"/api/remote-sessions/{session_id}/viewer-tickets",
+        headers=doctor,
+        json={"connection_grant": created["connection_grant"]},
+    ).json()
+    protocol = f"hospital-ticket.{access['viewer_ticket']}"
+
+    with client.websocket_connect(
+        access["websocket_path"],
+        headers={"origin": "http://localhost:5173"},
+        subprotocols=[protocol],
+    ) as websocket:
+        assert websocket.accepted_subprotocol == protocol
+        assert websocket.receive_bytes() == b"RFB 003.008\n"
+        websocket.send_bytes(b"RFB 003.008\n")
+        assert websocket.receive_bytes() == b"\x01\x01"
+        websocket.send_bytes(b"\x01")
+        assert websocket.receive_bytes() == b"\x00\x00\x00\x00"
+        websocket.send_bytes(b"\x01")
+        assert websocket.receive_bytes().endswith(b"test")
+
+    server_thread.join(timeout=2)
+    listener.close()
+    assert observed == {
+        "version": b"RFB 003.008\n",
+        "security": b"\x02",
+        "response": bytes.fromhex("47b69870db5f914d6f11358d0ccb9db8"),
+        "shared": b"\x01",
+    }
 

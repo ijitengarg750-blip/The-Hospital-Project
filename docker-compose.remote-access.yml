@@ -1,0 +1,12 @@
+services:
+  backend:
+    environment:
+      VNC_TARGETS_FILE: /run/configs/vnc-targets.json
+    volumes:
+      - ./deployment/vnc-targets.json:/run/configs/vnc-targets.json:ro
+    secrets:
+      - sirius_vnc_password
+
+secrets:
+  sirius_vnc_password:
+    file: ${SIRIUS_VNC_PASSWORD_FILE:?Set SIRIUS_VNC_PASSWORD_FILE to a protected host file}

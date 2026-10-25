@@ -1,0 +1,7 @@
+{
+  "SIRIUS-1": {
+    "host": "diagnostic-pc.example.hospital",
+    "port": 5900,
+    "password_file": "/run/secrets/sirius_vnc_password"
+  }
+}
