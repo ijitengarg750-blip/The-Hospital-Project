@@ -25,8 +25,11 @@ def client(tmp_path, monkeypatch):
         storage_root=tmp_path / "clinical-data",
         doctor_username="test-doctor",
         doctor_password="test-password",
+        admin_username="test-admin",
+        admin_password="admin-password",
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
         collector_api_key="test-collector-key",
+        session_cookie_secure=False,
     )
     engine = build_engine(settings.database_url)
     sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -45,8 +48,13 @@ def client(tmp_path, monkeypatch):
 
 
 def doctor_headers(client: TestClient) -> dict[str, str]:
-    response = client.post("/api/auth/login", json={"username": "test-doctor", "password": "test-password"})
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+    client.post("/api/auth/login", json={"username": "test-doctor", "password": "test-password"})
+    return {}
+
+
+def admin_headers(client: TestClient) -> dict[str, str]:
+    client.post("/api/auth/login", json={"username": "test-admin", "password": "admin-password"})
+    return {}
 
 
 def create_study() -> tuple[int, int]:
@@ -66,7 +74,7 @@ def create_study() -> tuple[int, int]:
 def provision_agent(client: TestClient, machine_id: int, machine_code: str = "SIRIUS-1") -> tuple[str, dict[str, str]]:
     response = client.post(
         f"/api/machines/{machine_id}/agent-credentials",
-        headers=doctor_headers(client),
+        headers=admin_headers(client),
     )
     assert response.status_code == 201
     key = response.json()["agent_key"]
@@ -77,6 +85,10 @@ def test_agent_credential_is_returned_once_and_only_its_hash_is_stored(client):
     from app.remote_sessions import MachineAgent
 
     machine_id, _ = create_study()
+    assert client.post(
+        f"/api/machines/{machine_id}/agent-credentials",
+        headers=doctor_headers(client),
+    ).status_code == 403
     key, agent_headers = provision_agent(client, machine_id)
 
     with database.SessionLocal() as db:

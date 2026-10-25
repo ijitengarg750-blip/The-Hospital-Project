@@ -12,6 +12,7 @@ type Study = { id: number; study_uid: string; title: string; acquisition_datetim
 type Patient = { practo_uid: string; name?: string; date_of_birth?: string; studies: Study[] };
 type RemoteSession = { id: string; status: "requested" | "ready" | "connected" | "ended" | "expired" | "failed"; machine_state: string; end_reason?: string };
 type RemoteMessage = { id: number; sender: "doctor" | "local_operator"; body: string; created_at: string };
+type AuthSession = { username: string; role: "admin" | "doctor"; mfa_required: boolean };
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -20,11 +21,9 @@ class ApiError extends Error {
 }
 
 const api = async (path: string, options: RequestInit = {}) => {
-  const token = localStorage.getItem("hospital-token");
   const headers = new Headers(options.headers);
-  if (token) headers.set("Authorization", `Bearer ${token}`);
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   if (!response.ok) {
     let detail = "Request failed";
     try {
@@ -37,7 +36,7 @@ const api = async (path: string, options: RequestInit = {}) => {
   return response;
 };
 
-function Login({ onLogin }: { onLogin: () => void }) {
+function Login({ onLogin }: { onLogin: (session: AuthSession) => void }) {
   const [username, setUsername] = useState("doctor");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -47,9 +46,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
     event.preventDefault(); setError(""); setBusy(true);
     try {
       const response = await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
-      const result = await response.json();
-      localStorage.setItem("hospital-token", result.access_token);
-      onLogin();
+      onLogin(await response.json());
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
 
@@ -269,7 +266,7 @@ function groupStudies(studies: Study[]) {
   return groups;
 }
 
-function Dashboard({ onLogout }: { onLogout: () => void }) {
+function Dashboard({ session, onLogout }: { session: AuthSession; onLogout: () => void }) {
   const [showRemote, setShowRemote] = useState(false);
   const [machines, setMachines] = useState<Record<number, Machine>>({});
   const [uid, setUid] = useState("");
@@ -292,8 +289,8 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   return <>
     <header><div className="wordmark"><Activity size={23}/><span>Diagnostic Dashboard</span></div><button className="logout" onClick={onLogout}><LogOut size={16}/>Sign out</button></header>
     <main className="dashboard">
-      <button className="setup-toggle secondary" aria-expanded={showRemote} onClick={() => setShowRemote(!showRemote)}><MonitorUp size={17}/>Remote access setup</button>
-      {showRemote && <RemoteSetup onUpdate={machine => setMachines(current => ({ ...current, [machine.id]: machine }))}/>}
+      {session.role === "admin" && <button className="setup-toggle secondary" aria-expanded={showRemote} onClick={() => setShowRemote(!showRemote)}><MonitorUp size={17}/>Diagnostic machines</button>}
+      {session.role === "admin" && showRemote && <RemoteSetup onUpdate={machine => setMachines(current => ({ ...current, [machine.id]: machine }))}/>}
       <section className="hero"><p className="eyebrow">Patient lookup</p><h1>Find diagnostic history</h1><p>Search with the patient’s Practo UID.</p>
         <form className="search" onSubmit={search}><Search size={20}/><input aria-label="Practo UID" value={uid} onChange={e => setUid(e.target.value)} placeholder="Enter Practo UID" required autoFocus/><button disabled={busy}>{busy ? "Searching…" : "Search"}</button></form>
         {error && <p className="error search-error">{error}</p>}
@@ -307,9 +304,15 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
 }
 
 function App() {
-  const [loggedIn, setLoggedIn] = useState(Boolean(localStorage.getItem("hospital-token")));
-  const logout = () => { localStorage.removeItem("hospital-token"); setLoggedIn(false); };
-  return loggedIn ? <Dashboard onLogout={logout}/> : <Login onLogin={() => setLoggedIn(true)}/>;
+  const [session, setSession] = useState<AuthSession | null>();
+  useEffect(() => {
+    api("/api/auth/session").then(response => response.json()).then(setSession).catch(() => setSession(null));
+  }, []);
+  const logout = async () => {
+    try { await api("/api/auth/logout", { method: "POST" }); } finally { setSession(null); }
+  };
+  if (session === undefined) return <main className="login-shell"><p role="status">Loading secure sessionâ€¦</p></main>;
+  return session ? <Dashboard session={session} onLogout={logout}/> : <Login onLogin={setSession}/>;
 }
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode><App/></React.StrictMode>);

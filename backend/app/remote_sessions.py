@@ -15,7 +15,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column, selectinload
 
 from .database import Base, get_db
 from .models import AuditLog, Machine, Study, utcnow
-from .security import current_user
+from .security import AuthenticatedUser, current_user, require_admin
 
 router = APIRouter(prefix="/api")
 SESSION_LIFETIME = timedelta(minutes=5)
@@ -190,7 +190,7 @@ def consume_viewer_ticket(db: Session, session_id: str, ticket: str) -> RemoteSe
 @router.post("/machines/{machine_id}/agent-credentials", response_model=AgentCredentialOut, status_code=201)
 def provision_agent_credentials(
     machine_id: int,
-    user: str = Depends(current_user),
+    user: AuthenticatedUser = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     machine = db.get(Machine, machine_id)

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response as FastAPIResponse, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from PIL import Image, UnidentifiedImageError
@@ -20,7 +20,7 @@ from .phoenix_reports import PhoenixReportError, dicom_has_phoenix_report, rende
 from .remote_sessions import router as remote_sessions_router
 from .vnc_gateway import router as vnc_gateway_router
 from .schemas import FileOut, LoginRequest, MachineCreate, MachineOut, PatientOut, PhoenixReportOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
-from .security import authenticate, create_token, current_user, require_collector
+from .security import AuthenticatedUser, authenticate, create_token, current_user, require_admin, require_collector
 
 settings = get_settings()
 app = FastAPI(title="Hospital Diagnostic Dashboard API", version="1.0.0")
@@ -41,16 +41,36 @@ def health():
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    if not authenticate(payload.username, payload.password):
+def login(payload: LoginRequest, response: FastAPIResponse, db: Session = Depends(get_db)):
+    user = authenticate(payload.username, payload.password)
+    if not user:
         raise HTTPException(401, "Incorrect username or password")
-    db.add(AuditLog(username=payload.username, action="login"))
+    response.set_cookie(
+        settings.session_cookie_name,
+        create_token(user),
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite="strict",
+        max_age=settings.access_token_minutes * 60,
+        path="/",
+    )
+    db.add(AuditLog(username=str(user), action="login", resource=f"role:{user.role};amr:pwd"))
     db.commit()
-    return {"access_token": create_token(payload.username), "token_type": "bearer"}
+    return {"username": str(user), "role": user.role, "mfa_required": settings.mfa_required}
 
 
-@app.post("/api/machines", response_model=MachineOut)
-def create_machine(payload: MachineCreate, user: str = Depends(current_user), db: Session = Depends(get_db)):
+@app.post("/api/auth/logout", status_code=204)
+def logout(response: FastAPIResponse):
+    response.delete_cookie(settings.session_cookie_name, path="/")
+
+
+@app.get("/api/auth/session")
+def auth_session(user: AuthenticatedUser = Depends(current_user)):
+    return {"username": str(user), "role": user.role, "mfa_required": settings.mfa_required}
+
+
+@app.post("/api/machines", response_model=MachineOut, status_code=201)
+def create_machine(payload: MachineCreate, user: AuthenticatedUser = Depends(require_admin), db: Session = Depends(get_db)):
     if db.scalar(select(Machine).where(Machine.code == payload.code)):
         raise HTTPException(409, "Machine code already exists")
     machine = Machine(**payload.model_dump())
@@ -62,12 +82,12 @@ def create_machine(payload: MachineCreate, user: str = Depends(current_user), db
 
 
 @app.get("/api/machines", response_model=list[MachineOut])
-def list_machines(_: str = Depends(current_user), db: Session = Depends(get_db)):
+def list_machines(_: AuthenticatedUser = Depends(require_admin), db: Session = Depends(get_db)):
     return list(db.scalars(select(Machine).order_by(Machine.name)))
 
 
 @app.patch("/api/machines/{machine_id}/remote-access", response_model=MachineOut)
-def update_remote_access(machine_id: int, payload: RemoteAccessUpdate, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def update_remote_access(machine_id: int, payload: RemoteAccessUpdate, user: AuthenticatedUser = Depends(require_admin), db: Session = Depends(get_db)):
     machine = db.get(Machine, machine_id)
     if not machine:
         raise HTTPException(404, "Machine not found")
