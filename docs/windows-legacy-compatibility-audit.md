@@ -33,11 +33,11 @@ Go 1.20 is the final Go release that runs on Windows 7 and Windows 8; Go 1.21 re
 
 ## VNC security boundary
 
-The current gateway supports standard RFB 3.3/3.7/3.8 security type 2. TightVNC documents that this limits the password to eight characters and leaves desktop traffic unencrypted. The test PC firewall therefore accepts TCP 5900 only from the Docker laptop, and the two laptops must be on an isolated test LAN/VLAN. [TightVNC security FAQ](https://www.tightvnc.com/faq.php#howsecure).
+The machine agent now terminates mutual TLS (TLS 1.2 minimum), verifies the gateway client certificate, authenticates locally to standard RFB 3.3/3.7/3.8 security type 2, and proxies the authorized stream. The classic VNC endpoint is loopback-only; the test PC firewall permits agent TCP 5910 only from the Docker laptop. The enrolled agent public certificate is stored by the backend, while the agent private key and classic VNC password remain in the diagnostic PC's DPAPI-protected configuration. There is no plaintext fallback. [TightVNC security FAQ](https://www.tightvnc.com/faq.php#howsecure).
 
 Unsupported combinations:
 
-- VNC TCP 5900 exposed to the Internet, hospital-wide user VLAN, or Wi-Fi clients other than the gateway.
+- VNC TCP 5900 exposed beyond diagnostic-PC loopback, or agent TCP 5910 exposed to the Internet or non-gateway clients.
 - A legacy PC that cannot negotiate TLS 1.2 with the dashboard.
 - Unpatched Windows 7 without SP1.
 - Any production deployment that depends on an EOL Go 1.20 binary without a hospital-approved exception and isolation controls.

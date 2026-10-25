@@ -7,18 +7,21 @@ different trust boundaries and must not share a browser-visible credential.
 
 1. The doctor authenticates to the dashboard and receives a short-lived,
    machine-specific, single-use connection grant.
-2. The trusted gateway validates that grant and authenticates to the selected VNC
-   server. The browser never receives the reusable VNC password.
+2. The trusted gateway validates that grant and opens a mutually authenticated
+   TLS connection to the enrolled machine agent. The agent authenticates to a
+   loopback VNC server. The browser and backend never receive the reusable VNC
+   password or agent private key.
 3. A machine service reports state and can force the VNC connection closed. A
    user-session application provides the visible notice, messages, and local End
    Session button.
-4. The VNC server binds to the machine or protected hospital network only. The
-   gateway is the only normal VNC client path.
+4. The VNC server binds to loopback. The host firewall permits the mTLS agent
+   port only from the gateway. Certificate or TLS failure closes the connection
+   without a plaintext fallback.
 
 noVNC's API accepts a password in the browser client. That is suitable for manual
 entry but not for this design because JavaScript would receive the reusable
-secret. Automatic authentication therefore belongs behind the WebSocket gateway,
-not in a modified noVNC page.
+secret. Automatic authentication therefore belongs inside the diagnostic-PC
+agent, not in a modified noVNC page or server-side password file.
 
 ## Windows state matrix
 
