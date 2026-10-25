@@ -4,7 +4,17 @@ __pycache__/
 *.pyc
 node_modules/
 dist/
+.tmp-go-cache/
+windows-agent/build/
+windows-agent/.tools/
+windows-agent/.gocache/
+windows-agent/.gomodcache/
+windows-agent/.gotmp/
+deployment/vnc-targets.json
+deployment/test-tls/
+deployment/test-secrets/
 clinical-data/
 collector/state.json
 collector/*.exe
+.vscode/
 

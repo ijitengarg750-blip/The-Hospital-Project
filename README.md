@@ -6,11 +6,11 @@ This prototype/pilot-oriented build is intentionally **report-first**. It is int
 
 ## What is implemented
 
-- One-doctor authenticated dashboard.
+- Administrator and doctor roles with HttpOnly cookie sessions, login throttling, and MFA-provider readiness.
 - Exact Practo UID lookup.
 - Patient history grouped by examination date.
 - Report, image, video and original-DICOM access.
-- Machine-specific **Open live software** links.
+- Doctor-specific machine grants and one-click remote sessions through a mandatory encrypted agent tunnel.
 - PostgreSQL index with clinical files stored in a server folder.
 - DICOM parsing for patient identity, study identity and acquisition time.
 - Extraction of ZIP archives embedded in CSO private DICOM tags `(7001,1098)` and `(7001,1099)`.
@@ -33,7 +33,7 @@ Hospital server
                          -> clinical-data folder
 
 Doctor browser
-  Practo UID search -> report/history -> noVNC link
+  Practo UID search -> authorized history -> noVNC -> mTLS gateway -> machine agent -> loopback VNC
 ```
 
 ## Important identity rule
@@ -69,26 +69,9 @@ Do not expose port 8080 directly to the public internet. Use it on the hospital 
 
 ## Register the first machine
 
-Sign in to get a token, then create the Sirius machine. Replace the server address, password and noVNC URL:
+Sign in as the administrator and use **Diagnostic machines** to register the machine, configure its private agent address, grant a doctor, test connectivity, and issue a one-time enrollment token. The agent generates its private identity on the diagnostic PC and keeps the local VNC password in DPAPI-protected configuration; neither secret is returned to the browser or server.
 
-```bash
-TOKEN=$(curl -s http://SERVER_IP:8080/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"doctor","password":"YOUR_PASSWORD"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-
-curl http://SERVER_IP:8080/api/machines \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "code":"SIRIUS-ROOM-2",
-    "name":"CSO Sirius",
-    "modality":"Pupillography",
-    "location":"Diagnostic Room 2",
-    "no_vnc_url":"http://SERVER_IP:6080/vnc.html?autoconnect=true"
-  }'
-```
-
-No VNC password is stored in PostgreSQL or included in this project. The doctor enters it in the noVNC page. Restrict VNC to the hospital LAN and use a different strong password per machine.
+Use the [two-laptop encrypted remote-access guide](deployment/two-laptop-remote-access-test.md) for certificate generation, firewall scope, enrollment, failure tests, and rollback. Do not expose VNC or the agent tunnel to the public internet. This project deliberately does not deploy a VPN.
 
 ## Build the Windows collector
 
@@ -198,7 +181,8 @@ The database tells the dashboard which files belong to which patients; the direc
 - Image classification uses filenames/types and may leave items as general images.
 - "Other images / possible report or preview" remains intentionally uncertain until its clinical purpose is verified against Sirius.
 - Browser video appears only when an extracted browser-compatible format is available.
-- noVNC credentials are entered at the noVNC page rather than stored in the dashboard database.
+- Remote desktop traffic is encrypted and mutually authenticated between gateway and agent; classic VNC exists only on diagnostic-PC loopback. Missing certificates or a failed handshake do not fall back to plaintext.
+- Automatic Windows secure-desktop unlock/sign-in is not yet implemented. `LogonUserW` validation is not an interactive sign-in mechanism; see the [legacy compatibility audit](docs/windows-legacy-compatibility-audit.md).
 - Before routine clinical use, the hospital must approve user access, retention, backup, LAN/VPN exposure and audit policy.
 
 ## Development checks

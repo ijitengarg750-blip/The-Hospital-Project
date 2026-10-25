@@ -16,8 +16,11 @@ def client(tmp_path, monkeypatch):
         storage_root=tmp_path / "clinical-data",
         doctor_username="test-doctor",
         doctor_password="test-password",
+        admin_username="test-admin",
+        admin_password="admin-password",
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
         collector_api_key="test-collector-key",
+        session_cookie_secure=False,
         max_upload_bytes=16,
     )
     engine = build_engine(settings.database_url)
@@ -67,7 +70,7 @@ def test_collector_applies_streaming_upload_limit_before_ingestion(client):
     assert response.status_code == 413
 
 
-def test_api_data_endpoints_require_a_bearer_token(client):
+def test_api_data_endpoints_require_a_session(client):
     response = client.get("/api/patients/10042")
 
     assert response.status_code == 401
@@ -79,17 +82,41 @@ def test_login_rejects_wrong_credentials(client):
     assert response.status_code == 401
 
 
-def test_machine_registration_requires_login_and_rejects_duplicates(client):
+def login_as(client, username="test-doctor", password="test-password"):
+    return client.post("/api/auth/login", json={"username": username, "password": password})
+
+
+def test_login_uses_an_http_only_session_cookie_without_returning_a_token(client):
+    response = login_as(client)
+
+    assert response.status_code == 200
+    assert response.json() == {"username": "test-doctor", "role": "doctor", "mfa_required": False}
+    assert "access_token" not in response.text
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "SameSite=strict" in response.headers["set-cookie"]
+
+
+def test_login_rate_limit_blocks_brute_force_attempts(client):
+    for _ in range(5):
+        assert client.post("/api/auth/login", json={"username": "test-doctor", "password": "wrong"}).status_code == 401
+
+    blocked = client.post("/api/auth/login", json={"username": "test-doctor", "password": "test-password"})
+    assert blocked.status_code == 429
+    assert blocked.headers["retry-after"] == "900"
+
+
+def test_machine_registration_is_admin_only_and_rejects_duplicates(client):
     unauthenticated = client.post("/api/machines", json={"code": "TEST-1", "name": "Test"})
-    login = client.post("/api/auth/login", json={"username": "test-doctor", "password": "test-password"})
-    token = login.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
-    created = client.post("/api/machines", headers=headers, json={"code": "TEST-1", "name": "Test"})
-    duplicate = client.post("/api/machines", headers=headers, json={"code": "TEST-1", "name": "Test"})
+    login_as(client)
+    doctor = client.post("/api/machines", json={"code": "TEST-1", "name": "Test"})
+    login = login_as(client, "test-admin", "admin-password")
+    created = client.post("/api/machines", json={"code": "TEST-1", "name": "Test"})
+    duplicate = client.post("/api/machines", json={"code": "TEST-1", "name": "Test"})
 
     assert unauthenticated.status_code == 401
     assert login.status_code == 200
-    assert created.status_code == 200
+    assert doctor.status_code == 403
+    assert created.status_code == 201
     assert duplicate.status_code == 409
 
 
@@ -106,16 +133,34 @@ def test_collector_rejects_unknown_machine_before_dicom_ingestion(client):
 
 
 def auth_headers(client):
-    response = client.post("/api/auth/login", json={"username": "test-doctor", "password": "test-password"})
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+    login_as(client)
+    from sqlalchemy import select
+    from app.machine_admin import MachinePermission
+    from app.models import Machine
+    with database.SessionLocal() as db:
+        for machine_id in db.scalars(select(Machine.id)):
+            if not db.scalar(select(MachinePermission).where(
+                MachinePermission.machine_id == machine_id,
+                MachinePermission.doctor_username == "test-doctor",
+            )):
+                db.add(MachinePermission(machine_id=machine_id, doctor_username="test-doctor"))
+        db.commit()
+    return {}
+
+
+def admin_headers(client):
+    login_as(client, "test-admin", "admin-password")
+    return {}
 
 
 def test_remote_configuration_requires_login_and_persists(client):
-    headers = auth_headers(client)
+    headers = admin_headers(client)
     machine = client.post("/api/machines", headers=headers, json={"code": "TEST-1", "name": "Sirius"}).json()
     path = f"/api/machines/{machine['id']}/remote-access"
     payload = {"no_vnc_url": "http://localhost:6080/vnc.html?autoconnect=true&view_only=true"}
+    client.post("/api/auth/logout")
     assert client.patch(path, json=payload).status_code == 401
+    headers = admin_headers(client)
     assert client.patch(path, headers=headers, json=payload).status_code == 200
     assert client.get("/api/machines", headers=headers).json()[0]["no_vnc_url"] == payload["no_vnc_url"]
     assert client.patch(path, headers=headers, json={"no_vnc_url": None}).json()["no_vnc_url"] is None
@@ -123,7 +168,7 @@ def test_remote_configuration_requires_login_and_persists(client):
 
 @pytest.mark.parametrize("url", ["javascript:alert(1)", "//example.com/vnc.html", "http://u:p@example.com", "http://example.com/?password=secret", "http://example.com/#password=secret"])
 def test_remote_urls_reject_scripts_and_credentials(client, url):
-    headers = auth_headers(client)
+    headers = admin_headers(client)
     assert client.post("/api/machines", headers=headers, json={"code": "BAD", "name": "Bad", "no_vnc_url": url}).status_code == 422
 
 
