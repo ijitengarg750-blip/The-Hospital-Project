@@ -39,6 +39,9 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 	runtimeState := agent.NewRuntimeState(config.UIToken)
 	go runLocalControl(ctx, runtimeState.Handler(client))
 	go agent.Run(ctx, client, runtimeState, windowsState.Get)
+	if config.TunnelListen != "" {
+		go agent.RunTunnel(ctx, config)
+	}
 	statuses <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange}
 	for request := range requests {
 		switch request.Cmd {
@@ -94,6 +97,8 @@ func install(args []string) error {
 	server := flags.String("server", "", "dashboard base URL (HTTPS required outside localhost)")
 	machine := flags.String("machine", "", "registered machine code")
 	uiUser := flags.String("ui-user", "", "Windows account allowed to run the notification UI")
+	tunnelListen := flags.String("tunnel-listen", "0.0.0.0:5910", "mutual-TLS tunnel listen address")
+	vncAddress := flags.String("vnc-address", "127.0.0.1:5900", "loopback VNC server address")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -103,7 +108,7 @@ func install(args []string) error {
 	if !strings.HasPrefix(*server, "https://") && !strings.HasPrefix(*server, "http://localhost") && !strings.HasPrefix(*server, "http://127.0.0.1") {
 		return errors.New("server must use HTTPS")
 	}
-	fmt.Fprint(os.Stderr, "Agent key: ")
+	fmt.Fprint(os.Stderr, "One-time enrollment token: ")
 	stdin := windows.Handle(os.Stdin.Fd())
 	var consoleMode uint32
 	consoleInput := windows.GetConsoleMode(stdin, &consoleMode) == nil
@@ -111,22 +116,46 @@ func install(args []string) error {
 		_ = windows.SetConsoleMode(stdin, consoleMode&^windows.ENABLE_ECHO_INPUT)
 		defer windows.SetConsoleMode(stdin, consoleMode)
 	}
-	key, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	token, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if consoleInput {
 		fmt.Fprintln(os.Stderr)
 	}
-	if err != nil && len(key) == 0 {
+	if err != nil && len(token) == 0 {
 		return err
 	}
-	key = strings.TrimSpace(key)
-	if len(key) < 32 {
-		return errors.New("agent key is too short")
+	token = strings.TrimSpace(token)
+	if len(token) < 32 {
+		return errors.New("enrollment token is too short")
+	}
+	fmt.Fprint(os.Stderr, "Local VNC password (1-8 bytes): ")
+	vncPassword, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if consoleInput {
+		fmt.Fprintln(os.Stderr)
+	}
+	if err != nil && len(vncPassword) == 0 {
+		return err
+	}
+	vncPassword = strings.TrimSpace(vncPassword)
+	if len([]byte(vncPassword)) < 1 || len([]byte(vncPassword)) > 8 {
+		return errors.New("VNC password must be 1 to 8 bytes")
+	}
+	certificate, privateKey, err := agent.GenerateMachineIdentity(*machine)
+	if err != nil {
+		return err
+	}
+	enrollment, err := agent.Enroll(*server, *machine, token, certificate)
+	if err != nil {
+		return err
 	}
 	directory := dataDirectory()
 	if err := os.MkdirAll(directory, 0750); err != nil {
 		return err
 	}
-	config := agent.Config{ServerURL: *server, MachineCode: *machine, AgentKey: key, UIToken: randomToken()}
+	config := agent.Config{
+		ServerURL: *server, MachineCode: *machine, AgentKey: enrollment.AgentKey, UIToken: randomToken(),
+		TunnelListen: *tunnelListen, TunnelCertificate: certificate, TunnelPrivateKey: privateKey,
+		GatewayCACertificate: enrollment.GatewayCACertificate, VNCAddress: *vncAddress, VNCPassword: vncPassword,
+	}
 	serviceConfig := filepath.Join(directory, "service.dat")
 	uiConfig := filepath.Join(directory, "ui.dat")
 	if err := agent.SaveConfig(serviceConfig, config); err != nil {
@@ -182,6 +211,9 @@ func runConsole(configPath string) error {
 	defer cancel()
 	state := agent.NewRuntimeState(config.UIToken)
 	go runLocalControl(ctx, state.Handler(agent.NewClient(config)))
+	if config.TunnelListen != "" {
+		go agent.RunTunnel(ctx, config)
+	}
 	return agent.Run(ctx, agent.NewClient(config), state, agent.NewWindowsState().Get)
 }
 

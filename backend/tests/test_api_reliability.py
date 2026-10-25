@@ -96,6 +96,15 @@ def test_login_uses_an_http_only_session_cookie_without_returning_a_token(client
     assert "SameSite=strict" in response.headers["set-cookie"]
 
 
+def test_login_rate_limit_blocks_brute_force_attempts(client):
+    for _ in range(5):
+        assert client.post("/api/auth/login", json={"username": "test-doctor", "password": "wrong"}).status_code == 401
+
+    blocked = client.post("/api/auth/login", json={"username": "test-doctor", "password": "test-password"})
+    assert blocked.status_code == 429
+    assert blocked.headers["retry-after"] == "900"
+
+
 def test_machine_registration_is_admin_only_and_rejects_duplicates(client):
     unauthenticated = client.post("/api/machines", json={"code": "TEST-1", "name": "Test"})
     login_as(client)
@@ -125,6 +134,17 @@ def test_collector_rejects_unknown_machine_before_dicom_ingestion(client):
 
 def auth_headers(client):
     login_as(client)
+    from sqlalchemy import select
+    from app.machine_admin import MachinePermission
+    from app.models import Machine
+    with database.SessionLocal() as db:
+        for machine_id in db.scalars(select(Machine.id)):
+            if not db.scalar(select(MachinePermission).where(
+                MachinePermission.machine_id == machine_id,
+                MachinePermission.doctor_username == "test-doctor",
+            )):
+                db.add(MachinePermission(machine_id=machine_id, doctor_username="test-doctor"))
+        db.commit()
     return {}
 
 

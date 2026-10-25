@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 import tempfile
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Response as FastAPIResponse, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response as FastAPIResponse, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from PIL import Image, UnidentifiedImageError
@@ -15,17 +16,19 @@ from .config import get_settings
 from .database import Base, engine, get_db
 from .ingestion import ingest_upload
 from .dicom_import import role_for_member
-from .models import AuditLog, ClinicalFile, DicomObject, Machine, Patient, Study
+from .models import AuditLog, AuthAttempt, ClinicalFile, DicomObject, Machine, Patient, Study, utcnow
 from .phoenix_reports import PhoenixReportError, dicom_has_phoenix_report, render_dicom_report
 from .remote_sessions import router as remote_sessions_router
+from .machine_admin import MachinePermission, require_machine_access, router as machine_admin_router
 from .vnc_gateway import router as vnc_gateway_router
-from .schemas import FileOut, LoginRequest, MachineCreate, MachineOut, PatientOut, PhoenixReportOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
+from .schemas import FileOut, LoginRequest, MachineOut, PatientOut, PhoenixReportOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
 from .security import AuthenticatedUser, authenticate, create_token, current_user, require_admin, require_collector
 
 settings = get_settings()
 app = FastAPI(title="Hospital Diagnostic Dashboard API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(remote_sessions_router)
+app.include_router(machine_admin_router)
 app.include_router(vnc_gateway_router)
 
 
@@ -41,10 +44,28 @@ def health():
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginRequest, response: FastAPIResponse, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, request: Request, response: FastAPIResponse, db: Session = Depends(get_db)):
+    now = utcnow()
+    client_host = request.client.host if request.client else "unknown"
+    key_hash = sha256(f"{client_host}:{payload.username.casefold()}".encode()).hexdigest()
+    attempt = db.scalar(select(AuthAttempt).where(AuthAttempt.key_hash == key_hash).with_for_update())
+    window = timedelta(minutes=settings.auth_window_minutes)
+    if attempt and now - (attempt.window_started_at if attempt.window_started_at.tzinfo else attempt.window_started_at.replace(tzinfo=timezone.utc)) >= window:
+        db.delete(attempt)
+        db.flush()
+        attempt = None
+    if attempt and attempt.failures >= settings.auth_max_attempts:
+        raise HTTPException(429, "Too many sign-in attempts", headers={"Retry-After": str(settings.auth_window_minutes * 60)})
     user = authenticate(payload.username, payload.password)
     if not user:
+        if attempt:
+            attempt.failures += 1
+        else:
+            db.add(AuthAttempt(key_hash=key_hash, failures=1, window_started_at=now))
+        db.commit()
         raise HTTPException(401, "Incorrect username or password")
+    if attempt:
+        db.delete(attempt)
     response.set_cookie(
         settings.session_cookie_name,
         create_token(user),
@@ -69,23 +90,6 @@ def auth_session(user: AuthenticatedUser = Depends(current_user)):
     return {"username": str(user), "role": user.role, "mfa_required": settings.mfa_required}
 
 
-@app.post("/api/machines", response_model=MachineOut, status_code=201)
-def create_machine(payload: MachineCreate, user: AuthenticatedUser = Depends(require_admin), db: Session = Depends(get_db)):
-    if db.scalar(select(Machine).where(Machine.code == payload.code)):
-        raise HTTPException(409, "Machine code already exists")
-    machine = Machine(**payload.model_dump())
-    db.add(machine)
-    db.add(AuditLog(username=user, action="machine.create", resource=payload.code))
-    db.commit()
-    db.refresh(machine)
-    return machine
-
-
-@app.get("/api/machines", response_model=list[MachineOut])
-def list_machines(_: AuthenticatedUser = Depends(require_admin), db: Session = Depends(get_db)):
-    return list(db.scalars(select(Machine).order_by(Machine.name)))
-
-
 @app.patch("/api/machines/{machine_id}/remote-access", response_model=MachineOut)
 def update_remote_access(machine_id: int, payload: RemoteAccessUpdate, user: AuthenticatedUser = Depends(require_admin), db: Session = Depends(get_db)):
     machine = db.get(Machine, machine_id)
@@ -98,10 +102,11 @@ def update_remote_access(machine_id: int, payload: RemoteAccessUpdate, user: Aut
 
 
 @app.patch("/api/files/{file_id}/report-type", response_model=FileOut)
-def update_report_type(file_id: int, payload: ReportTypeUpdate, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def update_report_type(file_id: int, payload: ReportTypeUpdate, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     item = db.get(ClinicalFile, file_id)
     if not item:
         raise HTTPException(404, "File not found")
+    require_machine_access(user, item.study.machine_id, db)
     if item.kind not in {"image", "report_image"} or item.mime_type not in {"image/jpeg", "image/png"}:
         raise HTTPException(422, "Only JPEG or PNG images can be selected as report images")
     item.kind = "report_image" if payload.report_type else "image"
@@ -112,7 +117,7 @@ def update_report_type(file_id: int, payload: ReportTypeUpdate, user: str = Depe
 
 
 @app.get("/api/patients/{practo_uid}", response_model=PatientOut)
-def patient_by_uid(practo_uid: str, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def patient_by_uid(practo_uid: str, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     stmt = (
         select(Patient)
         .where(Patient.practo_uid == practo_uid)
@@ -126,16 +131,25 @@ def patient_by_uid(practo_uid: str, user: str = Depends(current_user), db: Sessi
     if not patient:
         raise HTTPException(404, "No patient found with this Practo UID")
     patient.studies.sort(key=lambda x: x.acquisition_datetime, reverse=True)
+    result = PatientOut.model_validate(patient)
+    if user.role != "admin":
+        allowed_machine_ids = set(db.scalars(select(MachinePermission.machine_id).where(
+            MachinePermission.doctor_username == str(user)
+        )))
+        result.studies = [study for study in result.studies if study.machine.id in allowed_machine_ids]
+        if not result.studies:
+            raise HTTPException(404, "No patient found with this Practo UID")
     db.add(AuditLog(username=user, action="patient.view", resource=practo_uid))
     db.commit()
-    return patient
+    return result
 
 
 @app.get("/api/files/{file_id}")
-def view_file(file_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def view_file(file_id: int, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     item = db.get(ClinicalFile, file_id)
     if not item:
         raise HTTPException(404, "File not found")
+    require_machine_access(user, item.study.machine_id, db)
     path = (settings.storage_root / item.relative_path).resolve()
     if settings.storage_root.resolve() not in path.parents or not path.is_file():
         raise HTTPException(404, "Stored file is unavailable")
@@ -165,10 +179,11 @@ def _is_automatic_report_image(study: Study, item: ClinicalFile) -> bool:
 
 
 @app.get("/api/studies/{study_id}/reports", response_model=list[FileOut])
-def study_reports(study_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def study_reports(study_id: int, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.files)))
     if not study:
         raise HTTPException(404, "Study not found")
+    require_machine_access(user, study.machine_id, db)
     reports = [item for item in study.files if item.kind in {"report", "report_image"}]
     reports.extend(item for item in study.files if item not in reports and _is_automatic_report_image(study, item))
     reports.sort(key=lambda item: (item.kind not in {"report", "report_image"}, item.id))
@@ -193,7 +208,7 @@ def _eye_name(laterality: str | None) -> str:
 
 
 @app.get("/api/studies/{study_id}/phoenix-reports", response_model=list[PhoenixReportOut])
-def phoenix_report_manifest(study_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def phoenix_report_manifest(study_id: int, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     study = db.scalar(
         select(Study)
         .where(Study.id == study_id)
@@ -201,6 +216,7 @@ def phoenix_report_manifest(study_id: int, user: str = Depends(current_user), db
     )
     if not study:
         raise HTTPException(404, "Study not found")
+    require_machine_access(user, study.machine_id, db)
     reports = []
     for item in sorted(study.dicom_objects, key=lambda value: (value.series_number or "", value.id)):
         path = _stored_path(item.original_file)
@@ -217,7 +233,7 @@ def phoenix_report_manifest(study_id: int, user: str = Depends(current_user), db
 
 
 @app.get("/api/studies/{study_id}/phoenix-reports/{object_id}.png")
-def phoenix_report_image(study_id: int, object_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def phoenix_report_image(study_id: int, object_id: int, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.patient)))
     item = db.scalar(
         select(DicomObject)
@@ -226,6 +242,7 @@ def phoenix_report_image(study_id: int, object_id: int, user: str = Depends(curr
     )
     if not study or not item:
         raise HTTPException(404, "Phoenix report source not found")
+    require_machine_access(user, study.machine_id, db)
     path = _stored_path(item.original_file)
     if not path:
         raise HTTPException(404, "Stored DICOM source is unavailable")
@@ -249,7 +266,7 @@ def phoenix_report_image(study_id: int, object_id: int, user: str = Depends(curr
 
 
 @app.get("/api/studies/{study_id}/inventory", response_model=StudyInventoryOut)
-def study_inventory(study_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def study_inventory(study_id: int, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     study = db.scalar(
         select(Study)
         .where(Study.id == study_id)
@@ -257,6 +274,7 @@ def study_inventory(study_id: int, user: str = Depends(current_user), db: Sessio
     )
     if not study:
         raise HTTPException(404, "Study not found")
+    require_machine_access(user, study.machine_id, db)
     objects = sorted(
         study.dicom_objects,
         key=lambda item: (item.series_number or "", item.series_uid or "", item.acquisition_datetime or "", item.sop_uid),
@@ -269,10 +287,11 @@ def study_inventory(study_id: int, user: str = Depends(current_user), db: Sessio
 
 
 @app.post("/api/studies/{study_id}/remote-session")
-def remote_session(study_id: int, user: str = Depends(current_user), db: Session = Depends(get_db)):
+def remote_session(study_id: int, user: AuthenticatedUser = Depends(current_user), db: Session = Depends(get_db)):
     study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.machine)))
     if not study or not study.machine.active or not study.machine.no_vnc_url:
         raise HTTPException(404, "Remote access is not configured for this machine")
+    require_machine_access(user, study.machine_id, db)
     try:
         remote_url = RemoteAccessUpdate(no_vnc_url=study.machine.no_vnc_url).no_vnc_url
     except ValueError:

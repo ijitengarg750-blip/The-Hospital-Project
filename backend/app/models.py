@@ -159,6 +159,13 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AuthAttempt(Base):
+    __tablename__ = "auth_attempts"
+    key_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class PatientMapping(Base):
     __tablename__ = "patient_mappings"
     __table_args__ = (UniqueConstraint("machine_id", "source_patient_id"),)

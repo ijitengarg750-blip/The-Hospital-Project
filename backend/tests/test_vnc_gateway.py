@@ -4,7 +4,9 @@ from io import BytesIO
 
 import pytest
 
-from app.vnc_gateway import GatewayConfigurationError, MachineVncTarget, authenticate_vnc, load_machine_target
+from app.config import Settings
+from app.models import Machine
+from app.vnc_gateway import GatewayConfigurationError, MachineVncTarget, authenticate_vnc, load_machine_target, open_secure_transport
 
 
 class ScriptedSocket:
@@ -56,3 +58,16 @@ def test_machine_target_reads_password_from_separate_secret_file(tmp_path):
 
     assert target == MachineVncTarget(host="127.0.0.1", port=5900, password="not-here")
     assert "not-here" not in config.read_text(encoding="utf-8")
+
+
+def test_secure_transport_fails_closed_without_both_peer_certificates(tmp_path):
+    machine = Machine(code="SIRIUS-1", name="Sirius")
+    network = type("Network", (), {
+        "host": "127.0.0.1",
+        "port": 5910,
+        "tls_server_name": "SIRIUS-1",
+        "agent_certificate_pem": None,
+    })()
+
+    with pytest.raises(GatewayConfigurationError, match="Mutual TLS"):
+        open_secure_transport(machine, network, Settings())

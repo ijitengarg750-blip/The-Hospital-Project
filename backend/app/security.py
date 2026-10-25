@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 import hmac
 
 import jwt
-from fastapi import Cookie, Depends, Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import get_settings

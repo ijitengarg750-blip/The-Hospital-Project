@@ -20,8 +20,8 @@ $machine = $machines | Where-Object { $_.code -eq $MachineCode } | Select-Object
 if (-not $machine) {
   $machine = Invoke-RestMethod -Method Post -Uri "$($DashboardUrl.TrimEnd('/'))/api/machines" -WebSession $session -ContentType 'application/json' -Body (@{code=$MachineCode; name=$MachineName; modality='Test'; location='Isolated test laptop'} | ConvertTo-Json)
 }
-$credential = Invoke-RestMethod -Method Post -Uri "$($DashboardUrl.TrimEnd('/'))/api/machines/$($machine.id)/agent-credentials" -WebSession $session
+$enrollment = Invoke-RestMethod -Method Post -Uri "$($DashboardUrl.TrimEnd('/'))/api/machines/$($machine.id)/enrollments" -WebSession $session
 Write-Host "Machine ID: $($machine.id)"
-Write-Host "Machine code: $($credential.machine_code)"
-Write-Host 'One-time agent key (paste only into Install-Agent.ps1 on the test laptop):'
-Write-Host $credential.agent_key
+Write-Host "Machine code: $($enrollment.machine_code)"
+Write-Host 'One-time enrollment token (paste only into Install-Agent.ps1 on the test laptop):'
+Write-Host $enrollment.enrollment_token

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column, selectinload
 
 from .database import Base, get_db
 from .models import AuditLog, Machine, Study, utcnow
-from .security import AuthenticatedUser, current_user, require_admin
+from .security import AuthenticatedUser, current_user
 
 router = APIRouter(prefix="/api")
 SESSION_LIFETIME = timedelta(minutes=5)
@@ -60,11 +60,6 @@ class RemoteMessage(Base):
     sender: Mapped[str] = mapped_column(String(30))
     body: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
-class AgentCredentialOut(BaseModel):
-    machine_code: str
-    agent_key: str
 
 
 class AgentHeartbeat(BaseModel):
@@ -187,29 +182,6 @@ def consume_viewer_ticket(db: Session, session_id: str, ticket: str) -> RemoteSe
     return session
 
 
-@router.post("/machines/{machine_id}/agent-credentials", response_model=AgentCredentialOut, status_code=201)
-def provision_agent_credentials(
-    machine_id: int,
-    user: AuthenticatedUser = Depends(require_admin),
-    db: Session = Depends(get_db),
-):
-    machine = db.get(Machine, machine_id)
-    if not machine or not machine.active:
-        raise HTTPException(404, "Machine not found")
-    key = secrets.token_urlsafe(32)
-    identity = db.scalar(select(MachineAgent).where(MachineAgent.machine_id == machine_id))
-    if identity:
-        identity.key_hash = sha256(key.encode()).hexdigest()
-        identity.state = "unavailable"
-        identity.last_seen_at = None
-    else:
-        identity = MachineAgent(machine_id=machine_id, key_hash=sha256(key.encode()).hexdigest())
-        db.add(identity)
-    db.add(AuditLog(username=user, action="machine.agent.credential.rotate", resource=machine.code))
-    db.commit()
-    return {"machine_code": machine.code, "agent_key": key}
-
-
 @router.post("/agent/heartbeat", response_model=AgentStatusOut)
 def agent_heartbeat(
     payload: AgentHeartbeat,
@@ -226,13 +198,21 @@ def agent_heartbeat(
 @router.post("/studies/{study_id}/remote-sessions", response_model=SessionCreatedOut, status_code=201)
 def create_remote_session(
     study_id: int,
-    user: str = Depends(current_user),
+    user: AuthenticatedUser = Depends(current_user),
     db: Session = Depends(get_db),
 ):
     now = utcnow()
     study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.machine)))
     if not study or not study.machine.active:
         raise HTTPException(404, "Remote access is not configured for this machine")
+    if user.role != "admin":
+        from .machine_admin import MachinePermission
+        permitted = db.scalar(select(MachinePermission).where(
+            MachinePermission.machine_id == study.machine_id,
+            MachinePermission.doctor_username == str(user),
+        ))
+        if not permitted:
+            raise HTTPException(403, "You do not have access to this diagnostic machine")
     identity = db.scalar(select(MachineAgent).where(MachineAgent.machine_id == study.machine_id))
     if not identity or not identity.last_seen_at or now - _as_utc(identity.last_seen_at) > AGENT_ONLINE_WINDOW:
         raise HTTPException(409, "Machine agent is offline")

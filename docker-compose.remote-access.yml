@@ -1,12 +1,8 @@
 services:
   backend:
     environment:
-      VNC_TARGETS_FILE: /run/configs/vnc-targets.json
+      VNC_GATEWAY_CA_CERT_FILE: /run/mtls/gateway-ca.crt
+      VNC_GATEWAY_CLIENT_CERT_FILE: /run/mtls/gateway-client.crt
+      VNC_GATEWAY_CLIENT_KEY_FILE: /run/mtls/gateway-client.key
     volumes:
-      - ./deployment/vnc-targets.json:/run/configs/vnc-targets.json:ro
-    secrets:
-      - sirius_vnc_password
-
-secrets:
-  sirius_vnc_password:
-    file: ${SIRIUS_VNC_PASSWORD_FILE:?Set SIRIUS_VNC_PASSWORD_FILE to a protected host file}
+      - ./deployment/test-tls:/run/mtls:ro

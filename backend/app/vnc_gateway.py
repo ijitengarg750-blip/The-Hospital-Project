@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 import re
 import socket
+import ssl
 import struct
+import time
+from typing import Any
 
 from Crypto.Cipher import DES
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -18,6 +21,7 @@ from .remote_sessions import RemoteSession, consume_viewer_ticket
 
 router = APIRouter(prefix="/api")
 _VERSION = re.compile(rb"RFB 003\.(\d{3})\n")
+_TUNNEL_READY = b"HOSPITAL-RFB/1\n"
 
 
 class GatewayConfigurationError(RuntimeError):
@@ -31,6 +35,8 @@ class MachineVncTarget:
     password: str = field(repr=False)
 
 
+# Legacy direct-RFB helpers are retained for isolated compatibility tests only.
+# The production WebSocket route always uses open_secure_transport below.
 def _read_exact(connection, size: int) -> bytes:
     result = bytearray()
     while len(result) < size:
@@ -101,6 +107,50 @@ def load_machine_target(config_path: Path, machine_code: str) -> MachineVncTarge
     return MachineVncTarget(host=host, port=port, password=password)
 
 
+def open_secure_transport(machine: Machine, network: Any, settings) -> ssl.SSLSocket:
+    if (
+        not network
+        or not network.agent_certificate_pem
+        or not settings.vnc_gateway_client_cert_file
+        or not settings.vnc_gateway_client_key_file
+    ):
+        raise GatewayConfigurationError("Mutual TLS transport is not configured")
+    cert_file = Path(settings.vnc_gateway_client_cert_file)
+    key_file = Path(settings.vnc_gateway_client_key_file)
+    if not cert_file.is_absolute() or not key_file.is_absolute() or not cert_file.is_file() or not key_file.is_file():
+        raise GatewayConfigurationError("Gateway client identity is not securely configured")
+    raw = None
+    connection = None
+    try:
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cadata=network.agent_certificate_pem)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        raw = socket.create_connection((network.host, network.port), timeout=5)
+        connection = context.wrap_socket(raw, server_hostname=network.tls_server_name)
+        raw = None  # Ownership moved to the TLS socket.
+        connection.settimeout(5)
+        if _read_exact(connection, len(_TUNNEL_READY)) != _TUNNEL_READY:
+            raise GatewayConfigurationError("Agent tunnel did not authorize the VNC connection")
+        connection.settimeout(None)
+        return connection
+    except (OSError, ssl.SSLError, ValueError, GatewayConfigurationError) as exc:
+        if connection:
+            connection.close()
+        elif raw:
+            raw.close()
+        raise GatewayConfigurationError("Mandatory encrypted VNC transport failed") from exc
+
+
+def probe_secure_transport(machine: Machine, network: Any, settings) -> tuple[str, int | None, str | None]:
+    started = time.monotonic()
+    try:
+        connection = open_secure_transport(machine, network, settings)
+    except GatewayConfigurationError:
+        return "unreachable", None, "Encrypted agent tunnel could not be established"
+    connection.close()
+    return "reachable", round((time.monotonic() - started) * 1000), None
+
+
 def _ticket_from_protocols(websocket: WebSocket) -> tuple[str, str] | None:
     for protocol in websocket.headers.get("sec-websocket-protocol", "").split(","):
         protocol = protocol.strip()
@@ -143,8 +193,8 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
     settings = get_settings()
     origin = websocket.headers.get("origin")
     ticket_data = _ticket_from_protocols(websocket)
-    if origin not in settings.origins or not ticket_data or not settings.vnc_targets_file:
-        reason = "origin" if origin not in settings.origins else "ticket" if not ticket_data else "configuration"
+    if origin not in settings.origins or not ticket_data:
+        reason = "origin" if origin not in settings.origins else "ticket"
         await websocket.close(code=1008, reason=reason)
         return
     protocol, ticket = ticket_data
@@ -154,19 +204,14 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
             await websocket.close(code=1008)
             return
         machine_code = db.get(Machine, session.machine_id).code
-        try:
-            target = load_machine_target(settings.vnc_targets_file, machine_code)
-        except GatewayConfigurationError:
-            await websocket.close(code=1011)
-            return
+        machine = db.get(Machine, session.machine_id)
+        from .machine_admin import MachineNetwork
+        network = db.get(MachineNetwork, session.machine_id)
         db.add(AuditLog(username=session.doctor_username, action="remote.gateway.connect", resource=f"session:{session.id};machine:{machine_code}"))
         db.commit()
-    upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    upstream.settimeout(5)
+    upstream = None
     try:
-        await asyncio.to_thread(upstream.connect, (target.host, target.port))
-        await asyncio.to_thread(authenticate_vnc, upstream, target.password)
-        upstream.settimeout(None)
+        upstream = await asyncio.to_thread(open_secure_transport, machine, network, settings)
         await websocket.accept(subprotocol=protocol)
         await _browser_handshake(websocket)
         tasks = {
@@ -191,4 +236,5 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
         if websocket.client_state.name == "CONNECTED":
             await websocket.close(code=1011)
     finally:
-        upstream.close()
+        if upstream:
+            upstream.close()

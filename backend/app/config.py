@@ -17,9 +17,14 @@ class Settings(BaseSettings):
     session_cookie_name: str = "hospital_session"
     session_cookie_secure: bool = True
     mfa_required: bool = False
+    auth_max_attempts: int = 5
+    auth_window_minutes: int = 15
     max_upload_bytes: int = 2_000_000_000
     allowed_origins: str = "http://localhost:5173,http://localhost:8080"
     vnc_targets_file: Path | None = None
+    vnc_gateway_client_cert_file: Path | None = None
+    vnc_gateway_client_key_file: Path | None = None
+    vnc_gateway_ca_cert_file: Path | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

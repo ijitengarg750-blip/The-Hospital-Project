@@ -17,10 +17,16 @@ import (
 )
 
 type Config struct {
-	ServerURL   string `json:"server_url"`
-	MachineCode string `json:"machine_code"`
-	AgentKey    string `json:"agent_key"`
-	UIToken     string `json:"ui_token"`
+	ServerURL            string `json:"server_url"`
+	MachineCode          string `json:"machine_code"`
+	AgentKey             string `json:"agent_key"`
+	UIToken              string `json:"ui_token"`
+	TunnelListen         string `json:"tunnel_listen,omitempty"`
+	TunnelCertificate    string `json:"tunnel_certificate,omitempty"`
+	TunnelPrivateKey     string `json:"tunnel_private_key,omitempty"`
+	GatewayCACertificate string `json:"gateway_ca_certificate,omitempty"`
+	VNCAddress           string `json:"vnc_address,omitempty"`
+	VNCPassword          string `json:"vnc_password,omitempty"`
 }
 
 type Session struct {
@@ -42,6 +48,51 @@ type Client struct {
 	base   *url.URL
 	config Config
 	http   *http.Client
+}
+
+type EnrollmentResult struct {
+	MachineCode          string `json:"machine_code"`
+	AgentKey             string `json:"agent_key"`
+	GatewayCACertificate string `json:"gateway_ca_certificate"`
+}
+
+func Enroll(serverURL, machineCode, enrollmentToken, certificatePEM string) (EnrollmentResult, error) {
+	var result EnrollmentResult
+	base, err := url.Parse(strings.TrimRight(serverURL, "/"))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return result, errors.New("invalid server URL")
+	}
+	input := map[string]string{
+		"machine_code":          machineCode,
+		"enrollment_token":      enrollmentToken,
+		"agent_certificate_pem": certificatePEM,
+	}
+	body, err := json.Marshal(input)
+	if err != nil {
+		return result, err
+	}
+	reference, _ := url.Parse("/api/agent/enroll")
+	request, err := http.NewRequest(http.MethodPost, base.ResolveReference(reference).String(), bytes.NewReader(body))
+	if err != nil {
+		return result, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}}
+	response, err := client.Do(request)
+	if err != nil {
+		return result, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		return result, fmt.Errorf("enrollment failed with HTTP %d", response.StatusCode)
+	}
+	if err = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result); err != nil {
+		return result, err
+	}
+	if len(result.AgentKey) < 32 || !strings.Contains(result.GatewayCACertificate, "CERTIFICATE") {
+		return result, errors.New("enrollment response is incomplete")
+	}
+	return result, nil
 }
 
 func NewClient(config Config) *Client {

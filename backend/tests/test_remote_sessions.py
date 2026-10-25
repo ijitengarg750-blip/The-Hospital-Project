@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
-import json
 import socket
 import struct
 import threading
@@ -12,7 +11,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from app import database, ingestion, main, security, vnc_gateway
+from app import database, ingestion, machine_admin, main, security, vnc_gateway
 from app.config import Settings
 from app.database import Base, build_engine
 from app.models import Machine, Patient, Study
@@ -30,7 +29,9 @@ def client(tmp_path, monkeypatch):
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
         collector_api_key="test-collector-key",
         session_cookie_secure=False,
+        vnc_gateway_ca_cert_file=(tmp_path / "gateway-ca.crt").resolve(),
     )
+    settings.vnc_gateway_ca_cert_file.write_text("-----BEGIN CERTIFICATE-----\ntest-public-gateway-ca\n-----END CERTIFICATE-----\n", encoding="utf-8")
     engine = build_engine(settings.database_url)
     sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
@@ -39,6 +40,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(ingestion, "get_settings", lambda: settings)
     monkeypatch.setattr(security, "get_settings", lambda: settings)
     monkeypatch.setattr(vnc_gateway, "get_settings", lambda: settings)
+    monkeypatch.setattr(machine_admin, "get_settings", lambda: settings)
     Base.metadata.create_all(engine)
     with TestClient(main.app) as test_client:
         test_client.test_settings = settings
@@ -58,6 +60,8 @@ def admin_headers(client: TestClient) -> dict[str, str]:
 
 
 def create_study() -> tuple[int, int]:
+    from app.machine_admin import MachinePermission
+
     with database.SessionLocal() as db:
         machine = Machine(code="SIRIUS-1", name="Sirius")
         study = Study(
@@ -67,15 +71,18 @@ def create_study() -> tuple[int, int]:
             acquisition_datetime=datetime.now(timezone.utc),
         )
         db.add(study)
+        db.flush()
+        db.add(MachinePermission(machine_id=machine.id, doctor_username="test-doctor"))
         db.commit()
         return machine.id, study.id
 
 
 def provision_agent(client: TestClient, machine_id: int, machine_code: str = "SIRIUS-1") -> tuple[str, dict[str, str]]:
-    response = client.post(
-        f"/api/machines/{machine_id}/agent-credentials",
-        headers=admin_headers(client),
-    )
+    issued = client.post(f"/api/machines/{machine_id}/enrollments", headers=admin_headers(client))
+    response = client.post("/api/agent/enroll", json={
+        "machine_code": machine_code,
+        "enrollment_token": issued.json()["enrollment_token"],
+    })
     assert response.status_code == 201
     key = response.json()["agent_key"]
     return key, {"X-Machine-Code": machine_code, "X-Agent-Key": key}
@@ -86,7 +93,7 @@ def test_agent_credential_is_returned_once_and_only_its_hash_is_stored(client):
 
     machine_id, _ = create_study()
     assert client.post(
-        f"/api/machines/{machine_id}/agent-credentials",
+        f"/api/machines/{machine_id}/enrollments",
         headers=doctor_headers(client),
     ).status_code == 403
     key, agent_headers = provision_agent(client, machine_id)
@@ -292,39 +299,23 @@ def test_doctor_and_local_operator_can_exchange_messages_until_session_ends(clie
     ).status_code == 409
 
 
-def test_websocket_gateway_authenticates_to_vnc_before_exposing_the_rfb_stream(client):
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    port = listener.getsockname()[1]
-    challenge = bytes.fromhex("00112233445566778899aabbccddeeff")
+def test_websocket_gateway_uses_the_pre_authenticated_encrypted_agent_tunnel(client, monkeypatch):
+    gateway_side, agent_side = socket.socketpair()
     observed = {}
 
-    def fake_vnc_server():
-        connection, _ = listener.accept()
-        with connection:
-            connection.sendall(b"RFB 003.008\n")
-            observed["version"] = connection.recv(12)
-            connection.sendall(b"\x01\x02")
-            observed["security"] = connection.recv(1)
-            connection.sendall(challenge)
-            observed["response"] = connection.recv(16)
-            connection.sendall(b"\x00\x00\x00\x00")
-            observed["shared"] = connection.recv(1)
-            connection.sendall(
+    def fake_agent_tunnel():
+        with agent_side:
+            observed["shared"] = agent_side.recv(1)
+            agent_side.sendall(
                 struct.pack(">HH", 1, 1)
                 + bytes.fromhex("2018000100ff00ff00ff100800000000")
                 + struct.pack(">I", 4)
                 + b"test"
             )
 
-    server_thread = threading.Thread(target=fake_vnc_server, daemon=True)
+    server_thread = threading.Thread(target=fake_agent_tunnel, daemon=True)
     server_thread.start()
-    password_file = client.test_tmp_path / "vnc-password"
-    password_file.write_text("correct\n", encoding="utf-8")
-    targets_file = client.test_tmp_path / "vnc-targets.json"
-    targets_file.write_text(json.dumps({"SIRIUS-1": {"host": "127.0.0.1", "port": port, "password_file": str(password_file)}}), encoding="utf-8")
-    client.test_settings.vnc_targets_file = targets_file
+    monkeypatch.setattr(vnc_gateway, "open_secure_transport", lambda *_: gateway_side)
 
     machine_id, study_id = create_study()
     _, agent_headers = provision_agent(client, machine_id)
@@ -355,11 +346,5 @@ def test_websocket_gateway_authenticates_to_vnc_before_exposing_the_rfb_stream(c
         assert websocket.receive_bytes().endswith(b"test")
 
     server_thread.join(timeout=2)
-    listener.close()
-    assert observed == {
-        "version": b"RFB 003.008\n",
-        "security": b"\x02",
-        "response": bytes.fromhex("47b69870db5f914d6f11358d0ccb9db8"),
-        "shared": b"\x01",
-    }
+    assert observed == {"shared": b"\x01"}
 

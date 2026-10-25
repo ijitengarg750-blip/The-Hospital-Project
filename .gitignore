@@ -16,4 +16,5 @@ deployment/test-secrets/
 clinical-data/
 collector/state.json
 collector/*.exe
+.vscode/
 

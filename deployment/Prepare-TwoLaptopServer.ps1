@@ -12,23 +12,7 @@ $repository = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Pat
 $envFile = Join-Path $repository '.env'
 if (-not (Test-Path -LiteralPath $envFile)) { throw '.env is missing. Run python setup-local.py --init first.' }
 
-$secretDirectory = Join-Path $repository 'deployment\test-secrets'
-New-Item -ItemType Directory -Path $secretDirectory -Force | Out-Null
-$passwordFile = Join-Path $secretDirectory 'vnc-password.txt'
-$secure = Read-Host 'Enter the same 1-to-8 character TEST password that you will configure in TightVNC' -AsSecureString
-$pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-try {
-  $vncPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
-  if ($vncPassword.Length -lt 1 -or $vncPassword.Length -gt 8) { throw 'Classic VNC requires a 1-to-8 character password.' }
-  [IO.File]::WriteAllText($passwordFile, $vncPassword, [Text.Encoding]::GetEncoding(28591))
-  $vncPassword = $null
-} finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
-icacls $passwordFile /inheritance:r /grant:r "$env:USERNAME`:F" | Out-Null
-
-$target = @{}
-$target[$MachineCode] = @{host=$TestPcIP; port=5900; password_file='/run/secrets/sirius_vnc_password'}
 $utf8 = New-Object Text.UTF8Encoding $false
-[IO.File]::WriteAllText((Join-Path $repository 'deployment\vnc-targets.json'), ($target | ConvertTo-Json -Depth 3), $utf8)
 
 $lines = [Collections.Generic.List[string]](Get-Content -LiteralPath $envFile)
 function Set-EnvValue([string]$Name, [string]$Value) {
@@ -38,10 +22,12 @@ function Set-EnvValue([string]$Name, [string]$Value) {
   $lines.Add("$Name=$Value")
 }
 Set-EnvValue 'ALLOWED_ORIGINS' "https://$ServerIP`:8443"
-Set-EnvValue 'SIRIUS_VNC_PASSWORD_FILE' $passwordFile
+Set-EnvValue 'VNC_GATEWAY_CA_CERT_FILE' '/run/mtls/gateway-ca.crt'
+Set-EnvValue 'VNC_GATEWAY_CLIENT_CERT_FILE' '/run/mtls/gateway-client.crt'
+Set-EnvValue 'VNC_GATEWAY_CLIENT_KEY_FILE' '/run/mtls/gateway-client.key'
 [IO.File]::WriteAllLines($envFile, $lines, $utf8)
 
 & (Join-Path $repository 'deployment\New-TestTlsCertificate.ps1') -ServerIP $ServerIP
 if ($LASTEXITCODE -ne 0) { throw 'TLS certificate generation failed.' }
 Write-Host "Server test configuration prepared for $MachineCode at $TestPcIP."
-Write-Host 'The VNC password was not printed. Enter the same test value in TightVNC service configuration.'
+Write-Host 'No VNC credential is stored on the server. The diagnostic-PC agent keeps it locally under DPAPI.'

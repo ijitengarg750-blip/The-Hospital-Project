@@ -7,12 +7,13 @@ import "./styles.css";
 type ClinicalFile = { id: number; kind: string; original_name: string; mime_type?: string; size_bytes: number; role?: string; embedded_path?: string };
 type PhoenixReport = { object_id: number; label: string; laterality?: string; mime_type: "image/png"; url: string };
 type ReportAsset = { key: string; label: string; mimeType?: string; url: string };
-type Machine = { id: number; code: string; name: string; modality?: string; location?: string; no_vnc_url?: string };
+type Machine = { id: number; code: string; name: string; modality?: string; location?: string; no_vnc_url?: string; active?: boolean; network?: { host: string; port: number; tls_server_name: string }; agent_status?: "online" | "offline"; vnc_status?: "reachable" | "unreachable" | "unknown"; windows_status?: "locked" | "unlocked" | "signed_out" | "unknown"; session_status?: "active" | "inactive"; last_error?: string; doctor_permissions?: string[] };
 type Study = { id: number; study_uid: string; title: string; acquisition_datetime: string; status: string; machine: Machine; files: ClinicalFile[]; dicom_objects_count: number; series_count: number; embedded_entries_count: number; image_entries_count: number; unique_images_count: number; pixel_data_objects_count: number };
 type Patient = { practo_uid: string; name?: string; date_of_birth?: string; studies: Study[] };
 type RemoteSession = { id: string; status: "requested" | "ready" | "connected" | "ended" | "expired" | "failed"; machine_state: string; end_reason?: string };
 type RemoteMessage = { id: number; sender: "doctor" | "local_operator"; body: string; created_at: string };
 type AuthSession = { username: string; role: "admin" | "doctor"; mfa_required: boolean };
+type AuditEntry = { id: number; username: string; action: string; resource?: string; created_at: string };
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -232,26 +233,93 @@ function StudyCard({ study }: { study: Study }) {
 
 function RemoteSetup({ onUpdate }: { onUpdate: (machine: Machine) => void }) {
   const [machines, setMachines] = useState<Machine[]>([]);
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [enrollment, setEnrollment] = useState<{ code: string; token: string; expires: string } | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(true);
+  const refresh = async () => {
+    const [machineResponse, auditResponse] = await Promise.all([api("/api/machines"), api("/api/audit-logs?limit=20")]);
+    setMachines(await machineResponse.json());
+    setAudit(await auditResponse.json());
+  };
   useEffect(() => {
-    api("/api/machines").then(response => response.json()).then(setMachines).catch(e => setError(e.message)).finally(() => setBusy(false));
+    refresh().catch(e => setError(e.message)).finally(() => setBusy(false));
   }, []);
-  const save = async (event: FormEvent<HTMLFormElement>, machine: Machine) => {
+  const register = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setError(""); setMessage(""); setBusy(true);
-    const url = String(new FormData(event.currentTarget).get("url") || "").trim();
+    const form = event.currentTarget; const data = new FormData(form);
     try {
-      const updated = await (await api(`/api/machines/${machine.id}/remote-access`, { method: "PATCH", body: JSON.stringify({ no_vnc_url: url || null }) })).json();
-      setMachines(current => current.map(item => item.id === updated.id ? updated : item));
-      onUpdate(updated); setMessage(`${machine.name}: ${url ? "URL saved. Open live software from an examination to test the connection." : "remote access cleared."}`);
+      await api("/api/machines", { method: "POST", body: JSON.stringify({
+        code: String(data.get("code") || "").trim(), name: String(data.get("name") || "").trim(),
+        modality: String(data.get("modality") || "").trim() || null, location: String(data.get("location") || "").trim() || null,
+        network: { host: String(data.get("host") || "").trim(), port: Number(data.get("port")), tls_server_name: String(data.get("tls_server_name") || "").trim() },
+      }) });
+      form.reset(); await refresh(); setMessage("Diagnostic machine registered. Create an enrollment token when the PC is ready.");
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
-  return <section className="remote-setup" aria-label="Remote access setup">
-    <h2>Legacy remote URL</h2><p className="muted">Kept for existing deployments. New one-click sessions use the machine agent and the server-side VNC target/secret configuration; no password is sent to this page.</p>
-    {machines.map(machine => <form key={machine.id} onSubmit={event => save(event, machine)}><label htmlFor={`remote-${machine.id}`}>{machine.name} · {machine.code}<span className="muted">{machine.no_vnc_url ? "Configured · connection unverified" : "Not configured"}</span></label><div className="remote-input"><input id={`remote-${machine.id}`} name="url" type="url" defaultValue={machine.no_vnc_url || ""} placeholder="http://gateway:6080/vnc.html?view_only=true"/><button className="secondary" disabled={busy}>Save URL</button></div></form>)}
+  const save = async (event: FormEvent<HTMLFormElement>, machine: Machine) => {
+    event.preventDefault(); setError(""); setMessage(""); setBusy(true);
+    const data = new FormData(event.currentTarget);
+    try {
+      const updated = await (await api(`/api/machines/${machine.id}`, { method: "PATCH", body: JSON.stringify({
+        name: String(data.get("name") || "").trim(), modality: String(data.get("modality") || "").trim() || null,
+        location: String(data.get("location") || "").trim() || null,
+        network: { host: String(data.get("host") || "").trim(), port: Number(data.get("port")), tls_server_name: String(data.get("tls_server_name") || "").trim() },
+      }) })).json();
+      onUpdate(updated); await refresh(); setMessage(`${updated.name} updated.`);
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+  const act = async (machine: Machine, action: "test" | "enroll" | "revoke") => {
+    setError(""); setMessage(""); setBusy(true);
+    try {
+      if (action === "test") {
+        const result = await (await api(`/api/machines/${machine.id}/test-connection`, { method: "POST" })).json();
+        setMessage(result.vnc_status === "reachable" ? `${machine.name}: encrypted tunnel reachable (${result.latency_ms} ms).` : `${machine.name}: ${result.error}`);
+      } else if (action === "enroll") {
+        const result = await (await api(`/api/machines/${machine.id}/enrollments`, { method: "POST" })).json();
+        setEnrollment({ code: result.machine_code, token: result.enrollment_token, expires: result.expires_at });
+      } else if (window.confirm(`Disable ${machine.name} and revoke its agent now?`)) {
+        await api(`/api/machines/${machine.id}`, { method: "DELETE" });
+        setMessage(`${machine.name} disabled and its active credentials revoked.`);
+      }
+      await refresh();
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+  const grant = async (event: FormEvent<HTMLFormElement>, machine: Machine) => {
+    event.preventDefault(); setBusy(true); setError("");
+    const doctor = String(new FormData(event.currentTarget).get("doctor") || "").trim();
+    try { await api(`/api/machines/${machine.id}/permissions/${encodeURIComponent(doctor)}`, { method: "PUT" }); setMessage(`${doctor} can now access ${machine.name}.`); await refresh(); }
+    catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+  const revokeDoctor = async (machine: Machine, doctor: string) => {
+    setBusy(true); setError("");
+    try { await api(`/api/machines/${machine.id}/permissions/${encodeURIComponent(doctor)}`, { method: "DELETE" }); setMessage(`${doctor} can no longer access ${machine.name}.`); await refresh(); }
+    catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+  return <section className="remote-setup machine-admin" aria-label="Diagnostic machines administration">
+    <div className="admin-heading"><p className="eyebrow">Administrator only</p><h2>Diagnostic machines</h2><p className="muted">Register PCs, issue one-time enrollment, and verify the mandatory encrypted agent tunnel.</p></div>
+    <form className="machine-register" onSubmit={register}><h3>Register machine</h3><div className="field-grid">
+      <label>Unique code<input name="code" required placeholder="SIRIUS-02"/></label><label>Name<input name="name" required placeholder="Sirius room 2"/></label>
+      <label>Modality<input name="modality" placeholder="Corneal topography"/></label><label>Location<input name="location" placeholder="Eye clinic, room 2"/></label>
+      <label>Private network host<input name="host" required placeholder="10.20.30.40"/></label><label>TLS port<input name="port" type="number" min="1" max="65535" defaultValue="5910" required/></label>
+      <label>TLS server name<input name="tls_server_name" required placeholder="SIRIUS-02"/></label>
+    </div><button className="primary" disabled={busy}>Register diagnostic machine</button></form>
+    {enrollment && <aside className="enrollment" role="status"><strong>One-time enrollment for {enrollment.code}</strong><code>{enrollment.token}</code><span>Expires {new Date(enrollment.expires).toLocaleString()}. Paste it only into the agent installer; it cannot be reused.</span><button className="secondary" onClick={() => setEnrollment(null)}>Hide token</button></aside>}
+    <div className="machine-list">{machines.map(machine => <article className="machine-row" key={machine.id}>
+      <div className="machine-title"><div><h3>{machine.name}</h3><p>{machine.code} · {machine.location || "Location not set"}</p></div><span className={machine.active === false ? "state danger" : "state"}>{machine.active === false ? "Revoked" : "Active"}</span></div>
+      <dl className="state-grid"><div><dt>Agent</dt><dd>{machine.agent_status || "offline"}</dd></div><div><dt>VNC</dt><dd>{machine.vnc_status || "unknown"}</dd></div><div><dt>Windows</dt><dd>{machine.windows_status || "unknown"}</dd></div><div><dt>Session</dt><dd>{machine.session_status || "inactive"}</dd></div></dl>
+      {machine.last_error && <p className="error" role="alert">{machine.last_error}</p>}
+      <form className="machine-edit" onSubmit={event => save(event, machine)}><div className="field-grid">
+        <label>Name<input name="name" defaultValue={machine.name} required/></label><label>Modality<input name="modality" defaultValue={machine.modality || ""}/></label><label>Location<input name="location" defaultValue={machine.location || ""}/></label>
+        <label>Private network host<input name="host" defaultValue={machine.network?.host || ""} required/></label><label>TLS port<input name="port" type="number" min="1" max="65535" defaultValue={machine.network?.port || 5910} required/></label><label>TLS server name<input name="tls_server_name" defaultValue={machine.network?.tls_server_name || machine.code} required/></label>
+      </div><div className="admin-actions"><button className="secondary" disabled={busy}>Save configuration</button><button type="button" className="secondary" disabled={busy || machine.active === false} onClick={() => act(machine, "test")}>Test connection</button><button type="button" className="secondary" disabled={busy || machine.active === false} onClick={() => act(machine, "enroll")}>Provision / rotate</button><button type="button" className="danger-button" disabled={busy || machine.active === false} onClick={() => act(machine, "revoke")}>Disable</button></div></form>
+      <form className="permission-form" onSubmit={event => grant(event, machine)}><label>Grant doctor access<input name="doctor" required placeholder="doctor username"/></label><button className="secondary" disabled={busy || machine.active === false}>Grant access</button></form>
+      {!!machine.doctor_permissions?.length && <div className="permission-list" aria-label="Granted doctors">{machine.doctor_permissions.map(doctor => <span key={doctor}>{doctor}<button type="button" disabled={busy} onClick={() => revokeDoctor(machine, doctor)} aria-label={`Revoke ${doctor}`}>Revoke</button></span>)}</div>}
+    </article>)}</div>
     {busy && <p role="status">Working…</p>}{!busy && !machines.length && !error && <p>No machines registered yet.</p>}
     {error && <p role="alert" className="error">{error}</p>}{message && <p role="status">{message}</p>}
+    <div className="audit-list"><h3>Recent audit events</h3>{audit.map(item => <p key={item.id}><time>{new Date(item.created_at).toLocaleString()}</time><strong>{item.action}</strong><span>{item.resource || item.username}</span></p>)}</div>
   </section>;
 }
 
