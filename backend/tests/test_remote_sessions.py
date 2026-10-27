@@ -27,8 +27,8 @@ def client(tmp_path, monkeypatch):
         admin_username="test-admin",
         admin_password="admin-password",
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
-        collector_api_key="test-collector-key",
         session_cookie_secure=False,
+        allowed_origins="http://localhost:5173",
         vnc_gateway_ca_cert_file=(tmp_path / "gateway-ca.crt").resolve(),
     )
     settings.vnc_gateway_ca_cert_file.write_text("-----BEGIN CERTIFICATE-----\ntest-public-gateway-ca\n-----END CERTIFICATE-----\n", encoding="utf-8")

@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 ROOT = Path(__file__).resolve().parent
 ENV = ROOT / '.env'
 CONFIG = ROOT / 'collector' / 'config.json'
-KEYS = ('POSTGRES_PASSWORD', 'DOCTOR_PASSWORD', 'JWT_SECRET', 'COLLECTOR_API_KEY')
+KEYS = ('POSTGRES_PASSWORD', 'DOCTOR_PASSWORD', 'JWT_SECRET')
 
 
 def load_env(path):
@@ -28,7 +28,7 @@ def load_env(path):
 
 
 def placeholder(value):
-    return not value or any(s in value.lower() for s in ('replace', 'change-me', 'development', 'your-password', 'example'))
+    return not value or any(s in value.lower() for s in ('replace', 'change-me', 'development', 'your-password', 'example', 'paste-'))
 
 
 def init():
@@ -55,9 +55,8 @@ def init():
         example = ROOT / 'collector' / 'config.example.json'
         cfg = json.loads(example.read_text(encoding='utf-8'))
         cfg['server_url'] = 'http://localhost:8080'
-        cfg['api_key'] = env['COLLECTOR_API_KEY']
         CONFIG.write_text(json.dumps(cfg, indent=2) + '\n', encoding='utf-8')
-        print('Created collector/config.json for localhost.')
+        print('Created collector/config.json template for localhost; issue a per-machine collector credential before use.')
 
 
 def inspect():
@@ -65,12 +64,12 @@ def inspect():
     if not CONFIG.is_file():
         raise SystemExit(f'Missing {CONFIG}. Use --init for a NEW development setup.')
     cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
-    required = ('DOCTOR_USERNAME', 'DOCTOR_PASSWORD', 'COLLECTOR_API_KEY')
+    required = ('DOCTOR_USERNAME', 'DOCTOR_PASSWORD')
     absent = [k for k in required if not env.get(k)]
     if absent:
         raise SystemExit('Missing environment settings: ' + ', '.join(absent))
-    if cfg.get('api_key') != env['COLLECTOR_API_KEY']:
-        raise SystemExit('Collector API key does not match .env. No files changed; synchronize intentionally.')
+    if placeholder(cfg.get('collector_key', '')):
+        raise SystemExit('Collector credential is not provisioned. Issue a per-machine credential from the administrator API.')
     if not cfg.get('machine_code') or not cfg.get('server_url'):
         raise SystemExit('Collector machine_code or server_url is missing.')
     print('Configuration validated without modification.')

@@ -1,7 +1,7 @@
 {
   "machine_code": "SIRIUS-ROOM-2",
-  "server_url": "http://192.168.1.10:8080",
-  "api_key": "replace-with-the-COLLECTOR_API_KEY",
+  "server_url": "https://dashboard.hospital.example",
+  "collector_key": "paste-the-per-machine-collector-key",
   "watch_folders": ["C:\\PACS_EXPORT"],
   "extensions": [".dcm"],
   "practo_uid_regex": "",

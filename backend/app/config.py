@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password: str = "change-me-admin"
     jwt_secret: str = "development-only-change-me"
-    collector_api_key: str = "development-collector-key"
     access_token_minutes: int = 480
     session_cookie_name: str = "hospital_session"
     session_cookie_secure: bool = True

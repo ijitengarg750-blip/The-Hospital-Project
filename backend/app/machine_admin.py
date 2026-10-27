@@ -13,7 +13,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from .config import get_settings
 from .database import Base, get_db
-from .models import AuditLog, Machine, utcnow
+from .models import AuditLog, Machine, MachineCollectorCredential, utcnow
 from .remote_sessions import AGENT_ONLINE_WINDOW, MachineAgent, RemoteSession
 from .schemas import RemoteAccessUpdate
 from .security import AuthenticatedUser, require_admin
@@ -202,6 +202,30 @@ def create_enrollment(machine_id: int, user: AuthenticatedUser = Depends(require
     db.add(AuditLog(username=str(user), action="machine.enrollment.issue", resource=machine.code))
     db.commit()
     return {"machine_code": machine.code, "enrollment_token": token, "expires_at": expires_at}
+
+
+@router.post("/machines/{machine_id}/collector-credentials", status_code=201)
+def rotate_collector_credential(
+    machine_id: int,
+    response: Response,
+    user: AuthenticatedUser = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    machine = db.scalar(select(Machine).where(Machine.id == machine_id).with_for_update())
+    if not machine or not machine.active:
+        raise HTTPException(404, "Machine not found")
+    key = secrets.token_urlsafe(32)
+    key_hash = sha256(key.encode()).hexdigest()
+    credential = db.get(MachineCollectorCredential, machine.id)
+    if credential:
+        credential.key_hash = key_hash
+        credential.updated_at = utcnow()
+    else:
+        db.add(MachineCollectorCredential(machine_id=machine.id, key_hash=key_hash))
+    db.add(AuditLog(username=str(user), action="machine.collector_credential.rotate", resource=machine.code))
+    db.commit()
+    response.headers["Cache-Control"] = "no-store"
+    return {"machine_code": machine.code, "collector_key": key}
 
 
 @router.post("/agent/enroll", status_code=201)

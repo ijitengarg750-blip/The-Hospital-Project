@@ -34,6 +34,13 @@ class Machine(Base):
     studies: Mapped[list[Study]] = relationship(back_populates="machine")
 
 
+class MachineCollectorCredential(Base):
+    __tablename__ = "machine_collector_credentials"
+    machine_id: Mapped[int] = mapped_column(ForeignKey("machines.id"), primary_key=True)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class Study(Base):
     __tablename__ = "studies"
     id: Mapped[int] = mapped_column(primary_key=True)

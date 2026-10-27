@@ -11,6 +11,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,7 +22,7 @@ import (
 type Config struct {
 	MachineCode    string   `json:"machine_code"`
 	ServerURL      string   `json:"server_url"`
-	APIKey         string   `json:"api_key"`
+	CollectorKey   string   `json:"collector_key"`
 	Folders        []string `json:"watch_folders"`
 	Extensions     []string `json:"extensions"`
 	PractoUIDRegex string   `json:"practo_uid_regex"`
@@ -59,7 +60,7 @@ func isPermanentFailure(err error) bool {
 	if !errors.As(err, &responseError) {
 		return false
 	}
-	return responseError.StatusCode >= 400 && responseError.StatusCode < 500 && responseError.StatusCode != http.StatusRequestTimeout && responseError.StatusCode != http.StatusTooManyRequests
+	return responseError.StatusCode >= 400 && responseError.StatusCode < 500 && responseError.StatusCode != http.StatusUnauthorized && responseError.StatusCode != http.StatusForbidden && responseError.StatusCode != http.StatusRequestTimeout && responseError.StatusCode != http.StatusTooManyRequests
 }
 
 func retryDelay(attempts int) time.Duration {
@@ -74,6 +75,30 @@ func retryDelay(attempts int) time.Duration {
 		return 15 * time.Minute
 	}
 	return delay
+}
+
+func validateServerURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return errors.New("server_url must be an absolute HTTPS URL")
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1") {
+		return nil
+	}
+	return errors.New("server_url must use HTTPS except for loopback development")
+}
+
+func migrateCredentialFailures(state *State) {
+	for key, failure := range state.Failures {
+		if failure.Permanent && (strings.Contains(failure.LastError, "HTTP 401") || strings.Contains(failure.LastError, "HTTP 403")) {
+			failure.Permanent = false
+			failure.NextAttempt = time.Time{}
+			state.Failures[key] = failure
+		}
+	}
 }
 
 func (s *State) shouldAttempt(key, digest string, now time.Time) bool {
@@ -212,8 +237,12 @@ func upload(cfg Config, path string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
-	req.Header.Set("X-Collector-Key", cfg.APIKey)
-	client := &http.Client{Timeout: 30 * time.Minute}
+	req.Header.Set("X-Machine-Code", cfg.MachineCode)
+	req.Header.Set("X-Collector-Key", cfg.CollectorKey)
+	client := &http.Client{
+		Timeout:       30 * time.Minute,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -308,8 +337,11 @@ func main() {
 	if err := loadJSON(configPath, &cfg); err != nil {
 		log.Fatalf("cannot load config: %v", err)
 	}
-	if cfg.MachineCode == "" || cfg.ServerURL == "" || cfg.APIKey == "" || len(cfg.Folders) == 0 {
-		log.Fatal("machine_code, server_url, api_key and watch_folders are required")
+	if cfg.MachineCode == "" || cfg.ServerURL == "" || cfg.CollectorKey == "" || len(cfg.Folders) == 0 {
+		log.Fatal("machine_code, server_url, collector_key and watch_folders are required")
+	}
+	if err := validateServerURL(cfg.ServerURL); err != nil {
+		log.Fatal(err)
 	}
 	if cfg.StateFile == "" {
 		cfg.StateFile = "state.json"
@@ -347,6 +379,7 @@ func main() {
 	if state.Failures == nil {
 		state.Failures = map[string]Failure{}
 	}
+	migrateCredentialFailures(&state)
 	log.Printf("collector started for %s -> %s", cfg.MachineCode, strings.TrimRight(cfg.ServerURL, "/"))
 	for {
 		scan(cfg, &state)

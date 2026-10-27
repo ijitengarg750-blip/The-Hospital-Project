@@ -22,7 +22,6 @@ def client(tmp_path, monkeypatch):
         admin_username="test-admin",
         admin_password="admin-password",
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
-        collector_api_key="test-collector-key",
         session_cookie_secure=False,
         vnc_gateway_ca_cert_file=(tmp_path / "gateway-ca.crt").resolve(),
     )
@@ -99,6 +98,51 @@ def test_one_time_enrollment_rotation_and_revocation(client):
 
     assert client.delete(f"/api/machines/{machine['id']}").status_code == 204
     assert client.post("/api/agent/heartbeat", headers=rotated_headers, json={"state": "signed_out"}).status_code == 401
+
+
+def test_collector_credentials_are_machine_scoped_and_rotate_independently(client):
+    first = register_machine(client)
+    second = client.post("/api/machines", json={"code": "OCT-2", "name": "OCT Room 2"}).json()
+    enrollment = client.post(f"/api/machines/{first['id']}/enrollments").json()
+    agent = client.post("/api/agent/enroll", json={
+        "machine_code": first["code"],
+        "enrollment_token": enrollment["enrollment_token"],
+    }).json()
+    agent_headers = {"X-Machine-Code": first["code"], "X-Agent-Key": agent["agent_key"]}
+
+    issued = client.post(f"/api/machines/{first['id']}/collector-credentials")
+    assert issued.status_code == 201
+    assert issued.headers["cache-control"] == "no-store"
+    first_key = issued.json()["collector_key"]
+
+    accepted = client.post(
+        "/api/collector/upload",
+        headers={"X-Machine-Code": first["code"], "X-Collector-Key": first_key},
+        data={"machine_code": first["code"]},
+    )
+    wrong_machine = client.post(
+        "/api/collector/upload",
+        headers={"X-Machine-Code": second["code"], "X-Collector-Key": first_key},
+        data={"machine_code": second["code"]},
+    )
+    assert accepted.status_code == 422
+    assert "file" in accepted.text
+    assert wrong_machine.status_code == 401
+
+    rotated = client.post(f"/api/machines/{first['id']}/collector-credentials")
+    rotated_key = rotated.json()["collector_key"]
+    assert rotated_key != first_key
+    assert client.post(
+        "/api/collector/upload",
+        headers={"X-Machine-Code": first["code"], "X-Collector-Key": first_key},
+        data={"machine_code": first["code"]},
+    ).status_code == 401
+    assert client.post(
+        "/api/collector/upload",
+        headers={"X-Machine-Code": first["code"], "X-Collector-Key": rotated_key},
+        data={"machine_code": first["code"]},
+    ).status_code == 422
+    assert client.post("/api/agent/heartbeat", headers=agent_headers, json={"state": "locked"}).status_code == 200
 
 
 def test_doctor_permission_is_required_for_remote_sessions(client):

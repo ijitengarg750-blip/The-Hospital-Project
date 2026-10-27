@@ -7,11 +7,13 @@ import tempfile
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response as FastAPIResponse, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
+from starlette.concurrency import run_in_threadpool
 
+from . import database
 from .config import get_settings
 from .database import Base, engine, get_db
 from .ingestion import ingest_upload
@@ -22,7 +24,7 @@ from .remote_sessions import router as remote_sessions_router
 from .machine_admin import MachinePermission, require_machine_access, router as machine_admin_router
 from .vnc_gateway import router as vnc_gateway_router
 from .schemas import FileOut, LoginRequest, MachineOut, PatientOut, PhoenixReportOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
-from .security import AuthenticatedUser, authenticate, create_token, current_user, require_admin, require_collector
+from .security import AuthenticatedUser, authenticate, authenticate_collector_machine, create_token, current_user, require_admin
 
 settings = get_settings()
 app = FastAPI(title="Hospital Diagnostic Dashboard API", version="1.0.0")
@@ -30,6 +32,24 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credent
 app.include_router(remote_sessions_router)
 app.include_router(machine_admin_router)
 app.include_router(vnc_gateway_router)
+
+
+def _authenticate_collector_headers(machine_code: str, collector_key: str) -> str | None:
+    with database.SessionLocal() as db:
+        machine = authenticate_collector_machine(db, machine_code, collector_key)
+        return machine.code if machine else None
+
+
+@app.middleware("http")
+async def authenticate_collector_before_reading_upload(request: Request, call_next):
+    if request.url.path == "/api/collector/upload":
+        machine_code = request.headers.get("X-Machine-Code", "")
+        collector_key = request.headers.get("X-Collector-Key", "")
+        authenticated_code = await run_in_threadpool(_authenticate_collector_headers, machine_code, collector_key)
+        if not authenticated_code:
+            return JSONResponse(status_code=401, content={"detail": "Invalid collector credential"})
+        request.state.collector_machine_code = authenticated_code
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -301,9 +321,9 @@ def remote_session(study_id: int, user: AuthenticatedUser = Depends(current_user
     return {"url": remote_url}
 
 
-@app.post("/api/collector/upload", dependencies=[Depends(require_collector)])
+@app.post("/api/collector/upload")
 def collector_upload(
-    machine_code: str = Form(...),
+    request: Request,
     file: UploadFile = File(...),
     practo_uid: str | None = Form(default=None),
     study_uid: str | None = Form(default=None),
@@ -311,6 +331,7 @@ def collector_upload(
     acquisition_datetime: datetime | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
+    machine_code = request.state.collector_machine_code
     suffix = Path(file.filename or "upload.dcm").suffix
     temp_path: Path | None = None
     try:

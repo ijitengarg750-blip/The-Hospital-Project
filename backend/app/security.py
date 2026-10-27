@@ -1,11 +1,15 @@
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import hmac
 
 import jwt
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from .config import get_settings
+from .models import Machine, MachineCollectorCredential
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -60,7 +64,14 @@ def require_admin(user: AuthenticatedUser = Depends(current_user)) -> Authentica
     return user
 
 
-def require_collector(x_collector_key: str = Header(default="")) -> None:
-    if not hmac.compare_digest(x_collector_key, get_settings().collector_api_key):
-        raise HTTPException(401, "Invalid collector key")
+def authenticate_collector_machine(db: Session, machine_code: str, collector_key: str) -> Machine | None:
+    credential = db.scalar(
+        select(MachineCollectorCredential)
+        .join(Machine, Machine.id == MachineCollectorCredential.machine_id)
+        .where(Machine.code == machine_code, Machine.active.is_(True))
+    )
+    supplied_hash = sha256(collector_key.encode()).hexdigest()
+    if not credential or not hmac.compare_digest(supplied_hash, credential.key_hash):
+        return None
+    return db.get(Machine, credential.machine_id)
 

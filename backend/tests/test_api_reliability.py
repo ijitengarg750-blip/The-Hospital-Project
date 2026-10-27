@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -7,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from app import database, ingestion, main, security
 from app.config import Settings
 from app.database import Base, build_engine
+from app.models import Machine, MachineCollectorCredential
 
 
 @pytest.fixture
@@ -19,7 +21,6 @@ def client(tmp_path, monkeypatch):
         admin_username="test-admin",
         admin_password="admin-password",
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
-        collector_api_key="test-collector-key",
         session_cookie_secure=False,
         max_upload_bytes=16,
     )
@@ -31,6 +32,15 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(ingestion, "get_settings", lambda: settings)
     monkeypatch.setattr(security, "get_settings", lambda: settings)
     Base.metadata.create_all(engine)
+    with sessions() as db:
+        machine = Machine(code="COLLECTOR-1", name="Collector test machine")
+        db.add(machine)
+        db.flush()
+        db.add(MachineCollectorCredential(
+            machine_id=machine.id,
+            key_hash=sha256(b"test-machine-collector-key").hexdigest(),
+        ))
+        db.commit()
     with TestClient(main.app) as test_client:
         yield test_client
     Base.metadata.drop_all(engine)
@@ -40,7 +50,7 @@ def test_collector_rejects_absent_and_invalid_keys(client):
     absent = client.post("/api/collector/upload", data={"machine_code": "TEST-1"})
     invalid = client.post(
         "/api/collector/upload",
-        headers={"X-Collector-Key": "invalid"},
+        headers={"X-Machine-Code": "TEST-1", "X-Collector-Key": "invalid"},
         data={"machine_code": "TEST-1"},
     )
 
@@ -48,26 +58,42 @@ def test_collector_rejects_absent_and_invalid_keys(client):
     assert invalid.status_code == 401
 
 
-def test_collector_accepts_a_valid_key_then_validates_request_shape(client):
+def test_legacy_shared_collector_key_is_rejected(client):
     response = client.post(
         "/api/collector/upload",
-        headers={"X-Collector-Key": "test-collector-key"},
-        data={"machine_code": "TEST-1"},
+        headers={"X-Machine-Code": "COLLECTOR-1", "X-Collector-Key": "test-collector-key"},
+        data={"machine_code": "COLLECTOR-1"},
     )
 
-    assert response.status_code == 422
-    assert "file" in response.text
+    assert response.status_code == 401
 
 
 def test_collector_applies_streaming_upload_limit_before_ingestion(client):
     response = client.post(
         "/api/collector/upload",
-        headers={"X-Collector-Key": "test-collector-key"},
-        data={"machine_code": "TEST-1"},
+        headers={"X-Machine-Code": "COLLECTOR-1", "X-Collector-Key": "test-machine-collector-key"},
+        data={"machine_code": "COLLECTOR-1"},
         files={"file": ("large.dcm", b"x" * 17, "application/dicom")},
     )
 
     assert response.status_code == 413
+
+
+def test_machine_scoped_collector_credential_preserves_report_ingestion(client):
+    response = client.post(
+        "/api/collector/upload",
+        headers={"X-Machine-Code": "COLLECTOR-1", "X-Collector-Key": "test-machine-collector-key"},
+        data={
+            "machine_code": "COLLECTOR-1",
+            "practo_uid": "10042",
+            "study_uid": "COLLECTOR-1:continuity",
+            "title": "Collector continuity test",
+        },
+        files={"file": ("report.txt", b"report", "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["study_uid"] == "COLLECTOR-1:continuity"
 
 
 def test_api_data_endpoints_require_a_session(client):
@@ -120,16 +146,29 @@ def test_machine_registration_is_admin_only_and_rejects_duplicates(client):
     assert duplicate.status_code == 409
 
 
-def test_collector_rejects_unknown_machine_before_dicom_ingestion(client):
+def test_collector_rejects_a_machine_code_not_bound_to_its_credential(client):
     response = client.post(
         "/api/collector/upload",
-        headers={"X-Collector-Key": "test-collector-key"},
+        headers={"X-Machine-Code": "UNKNOWN", "X-Collector-Key": "test-machine-collector-key"},
         data={"machine_code": "UNKNOWN"},
         files={"file": ("not-read.dcm", b"not a DICOM", "application/dicom")},
     )
 
-    assert response.status_code == 422
-    assert response.json()["detail"] == "Unknown machine code: UNKNOWN"
+    assert response.status_code == 401
+
+
+def test_invalid_collector_is_rejected_before_multipart_validation(client):
+    response = client.post(
+        "/api/collector/upload",
+        headers={
+            "Content-Type": "application/octet-stream",
+            "X-Machine-Code": "COLLECTOR-1",
+            "X-Collector-Key": "invalid",
+        },
+        content=b"not a multipart upload",
+    )
+
+    assert response.status_code == 401
 
 
 def auth_headers(client):
@@ -162,7 +201,8 @@ def test_remote_configuration_requires_login_and_persists(client):
     assert client.patch(path, json=payload).status_code == 401
     headers = admin_headers(client)
     assert client.patch(path, headers=headers, json=payload).status_code == 200
-    assert client.get("/api/machines", headers=headers).json()[0]["no_vnc_url"] == payload["no_vnc_url"]
+    machines = client.get("/api/machines", headers=headers).json()
+    assert next(item for item in machines if item["code"] == "TEST-1")["no_vnc_url"] == payload["no_vnc_url"]
     assert client.patch(path, headers=headers, json={"no_vnc_url": None}).json()["no_vnc_url"] is None
 
 
