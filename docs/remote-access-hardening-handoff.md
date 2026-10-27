@@ -3,6 +3,8 @@
 Date: 2026-10-25
 Branch: `feature/remote-access-hardening`
 
+For the later live friend-PC pilot, including confirmed findings, unconfirmed assumptions, and the post-pilot disconnect fix, see [remote-access-pilot-findings-2026-10-27.md](remote-access-pilot-findings-2026-10-27.md).
+
 ## Delivered
 
 - Admin and doctor roles are embedded in short-lived signed sessions. Browser authentication uses an HttpOnly, Secure, SameSite=Strict cookie; no token is stored in browser storage.
