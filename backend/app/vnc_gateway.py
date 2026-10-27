@@ -17,7 +17,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from .config import get_settings
 from . import database
 from .models import AuditLog, Machine
-from .remote_sessions import RemoteSession, consume_viewer_ticket
+from .remote_sessions import RemoteSession, consume_viewer_ticket, utcnow
 
 router = APIRouter(prefix="/api")
 _VERSION = re.compile(rb"RFB 003\.(\d{3})\n")
@@ -210,6 +210,7 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
         db.add(AuditLog(username=session.doctor_username, action="remote.gateway.connect", resource=f"session:{session.id};machine:{machine_code}"))
         db.commit()
     upstream = None
+    end_reason = "gateway_disconnected"
     try:
         upstream = await asyncio.to_thread(open_secure_transport, machine, network, settings)
         await websocket.accept(subprotocol=protocol)
@@ -224,17 +225,28 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
             task.cancel()
         for task in done:
             if not task.cancelled():
-                task.exception()
-    except (OSError, ConnectionError, PermissionError, GatewayConfigurationError, WebSocketDisconnect):
-        with database.SessionLocal() as db:
-            session = db.get(RemoteSession, session_id)
-            if session and session.active_slot and session.status == "connected":
-                session.status = "failed"
-                session.active_slot = None
-                session.end_reason = "gateway_error"
-                db.commit()
+                error = task.exception()
+                if error:
+                    raise error
+    except WebSocketDisconnect:
+        end_reason = "gateway_disconnected"
+    except (OSError, ConnectionError, PermissionError, GatewayConfigurationError):
+        end_reason = "gateway_error"
         if websocket.client_state.name == "CONNECTED":
             await websocket.close(code=1011)
     finally:
         if upstream:
             upstream.close()
+        with database.SessionLocal() as db:
+            session = db.get(RemoteSession, session_id)
+            if session and session.active_slot and session.status == "connected":
+                session.status = "failed"
+                session.active_slot = None
+                session.ended_at = utcnow()
+                session.end_reason = end_reason
+                db.add(AuditLog(
+                    username=session.doctor_username,
+                    action="remote.gateway.disconnect",
+                    resource=f"session:{session.id};reason:{end_reason}",
+                ))
+                db.commit()

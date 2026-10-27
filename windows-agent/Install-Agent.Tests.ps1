@@ -21,6 +21,12 @@ Describe 'Install-Agent signature preflight' {
     $installer.Contains("'HospitalRemoteUI.lnk'") | Should Be $true
     $installer.Contains("'HospitalRemoteUI.cmd'") | Should Be $false
   }
+
+  It 'runs only the signed UI script and starts it for the installing UI user' {
+    $installer.Contains('-ExecutionPolicy AllSigned') | Should Be $true
+    $installer.Contains('if ($identity.User.Value -eq $sid)') | Should Be $true
+    $installer.Contains('Start-Process -FilePath $launcher') | Should Be $true
+  }
 }
 
 Describe 'New-PilotPackage defaults' {

@@ -59,19 +59,22 @@ $powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($launcher)
 $shortcut.TargetPath = $powerShell
-$shortcut.Arguments = "-NoProfile -File `"$destination\HospitalRemoteUI.ps1`""
+$shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy AllSigned -File `"$destination\HospitalRemoteUI.ps1`""
 $shortcut.WorkingDirectory = $destination
 $shortcut.Save()
 $launcherRecord = Join-Path (Join-Path $env:ProgramData 'HospitalRemoteAgent') 'ui-launcher-path.txt'
 [IO.File]::WriteAllText($launcherRecord, $launcher, [Text.Encoding]::Unicode)
 icacls $launcherRecord /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' | Out-Null
+if ($identity.User.Value -eq $sid) {
+  Start-Process -FilePath $launcher
+}
 Write-Host 'Hospital Remote Agent installed. Sign in as the UI user once to start the notification application.'
 
 # SIG # Begin signature block
 # MIIHTgYJKoZIhvcNAQcCoIIHPzCCBzsCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCCnFewCFcUTnux
-# lA5aiRi14v3hUPv0O31z2W6SrAKNB6CCBDAwggQsMIIClKADAgECAhA33nkWJxw9
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDNyIi2gk8Pr+3T
+# DZImqTgNpXEedNeqISizniRBl+lLYKCCBDAwggQsMIIClKADAgECAhA33nkWJxw9
 # pUTEsQCq7EsBMA0GCSqGSIb3DQEBCwUAMC4xLDAqBgNVBAMMI0hvc3BpdGFsIERp
 # YWdub3N0aWMgRGFzaGJvYXJkIFBpbG90MB4XDTI2MTAyNzExNTQ0MVoXDTI4MTAy
 # NzEyMDQ0MlowLjEsMCoGA1UEAwwjSG9zcGl0YWwgRGlhZ25vc3RpYyBEYXNoYm9h
@@ -97,15 +100,15 @@ Write-Host 'Hospital Remote Agent installed. Sign in as the UI user once to star
 # AnACAQEwQjAuMSwwKgYDVQQDDCNIb3NwaXRhbCBEaWFnbm9zdGljIERhc2hib2Fy
 # ZCBQaWxvdAIQN955FiccPaVExLEAquxLATANBglghkgBZQMEAgEFAKCBhDAYBgor
 # BgEEAYI3AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEE
-# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDr
-# p5gy+doq/WwxCK23DWutd21bshdel+/WVvT5c+NbRTANBgkqhkiG9w0BAQEFAASC
-# AYAcuSwJJ97BSElb72R/FAHLUCQEDtGckcra02OJu3sv3T61zb58lcZaSDKFD/+e
-# 1Q3VfpqsB/oi0LgWOo09QrygkbMnGbTfDYjXtbuZ/ldZNQQN92SIVyqtkk2AXAVU
-# n7tGUAu90mIpRYCXj3J3ujIGARZaQOHJJsaLlNxFllbaC0TA7z7AqYOqwGR66b4S
-# /HaD5N4sMRLQSSRNoXA2gmNdWgiYoumfYxO4wRwXryjLgwrxEdG+IEWINdFGizmZ
-# 1/VUxlXhJS0bbsoon82lU/J3YMinoac/BS3EgbGJTWk93WFAP08GpkJJZnySsz3K
-# sZ630klF/TgwD/XzGs0Ept/zS6z6YM7dPewvWkLV/cE9ZG4xpeOZsPrgSTg2DVlI
-# JzDkeIjIa62UCV/aIj2aYQLzYtxmIgyar79hqwwtjVJsXkehaH63e5Iu8L+OgDBE
-# AEw9/Ve+2RbirHXZDGHvvfb+ssP98Mb1zweA5OAo9pdYEIo8nfihvnNSPER4ZaD6
-# hdI=
+# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBZ
+# 609/b1YLuDxytFYPYZsLAJpJrddQZol2eb9MGzkttDANBgkqhkiG9w0BAQEFAASC
+# AYAaY92RWKBNIBOar40fAKCd7/ObqIAvhhidnxZAGbEas9hnmBai9falyriasy5y
+# vLGMGQivQ1xdiGiEjWi2HMpGDGnO2U0guXCriZ3sKUfrh2H8Xv/j+IdOvW4s3grm
+# Zm5CKkuz8CZUWL8d7T2lA5qKu4pm2EW1XbXuKvhDUUWqiUwxazlbt8iGHTe4O8Zy
+# I8IAzcFEQDFh1OePcr35TxcHUQIzd83eVDXfwSdwbUS3cVDbAfwR3x/8plyWV5bJ
+# hO3Ak8TKaq/hyiqjgrl1fd2E2mASaAX85n8XOQ8BtLDQQKEmfBMCWB/L/066PQwH
+# Ybf/0CxOKI13Pj8TyEDUx7m6dUJramc0W+JOEt3Zw8OJ0EF4qDdgfsjgbQjXHA5p
+# Y2/Yugj84VUI1QQ4mJ5PrQVxZpJahSNS0Dx8bNZEs68PYmVqiiB755ZmqDiibcED
+# Qbl39OtNquY5RrDo3Dr4Bf1chPcyh6RGPL1vUviQLDn6DhifTNPPJG/QRFqNYPMK
+# tJ4=
 # SIG # End signature block

@@ -348,3 +348,10 @@ def test_websocket_gateway_uses_the_pre_authenticated_encrypted_agent_tunnel(cli
     server_thread.join(timeout=2)
     assert observed == {"shared": b"\x01"}
 
+    from app.remote_sessions import RemoteSession
+    with database.SessionLocal() as db:
+        session = db.get(RemoteSession, session_id)
+        assert session.status == "failed"
+        assert session.active_slot is None
+        assert session.end_reason == "gateway_disconnected"
+

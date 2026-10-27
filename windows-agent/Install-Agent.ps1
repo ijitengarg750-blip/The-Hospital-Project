@@ -59,12 +59,15 @@ $powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($launcher)
 $shortcut.TargetPath = $powerShell
-$shortcut.Arguments = "-NoProfile -File `"$destination\HospitalRemoteUI.ps1`""
+$shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy AllSigned -File `"$destination\HospitalRemoteUI.ps1`""
 $shortcut.WorkingDirectory = $destination
 $shortcut.Save()
 $launcherRecord = Join-Path (Join-Path $env:ProgramData 'HospitalRemoteAgent') 'ui-launcher-path.txt'
 [IO.File]::WriteAllText($launcherRecord, $launcher, [Text.Encoding]::Unicode)
 icacls $launcherRecord /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' | Out-Null
+if ($identity.User.Value -eq $sid) {
+  Start-Process -FilePath $launcher
+}
 Write-Host 'Hospital Remote Agent installed. Sign in as the UI user once to start the notification application.'
 
 # SIG # Begin signature block

@@ -199,12 +199,21 @@ function StudyCard({ study }: { study: Study }) {
 
   const remote = async () => {
     setError(""); setBusy(true);
+    let sessionId: string | null = null;
     try {
       const created = await (await api(`/api/studies/${study.id}/remote-sessions`, { method: "POST" })).json();
-      await waitForReady(created.session.id);
-      const access = await (await api(`/api/remote-sessions/${created.session.id}/viewer-tickets`, { method: "POST", body: JSON.stringify({ connection_grant: created.connection_grant }) })).json();
-      setViewer({ sessionId: created.session.id, ticket: access.viewer_ticket, websocketPath: access.websocket_path });
-    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+      const createdSessionId: string = created.session.id;
+      sessionId = createdSessionId;
+      await waitForReady(createdSessionId);
+      const access = await (await api(`/api/remote-sessions/${createdSessionId}/viewer-tickets`, { method: "POST", body: JSON.stringify({ connection_grant: created.connection_grant }) })).json();
+      setViewer({ sessionId: createdSessionId, ticket: access.viewer_ticket, websocketPath: access.websocket_path });
+    } catch (e) {
+      if (sessionId) {
+        try { await api(`/api/remote-sessions/${sessionId}`, { method: "DELETE" }); }
+        catch { /* Preserve the original connection error. */ }
+      }
+      setError((e as Error).message);
+    } finally { setBusy(false); }
   };
 
   return <article className="study-card">
