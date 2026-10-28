@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.orm import sessionmaker
 
-from app import database, ingestion, machine_admin, main, security, vnc_gateway
+from app import database, ingestion, machine_admin, main, remote_sessions, security, vnc_gateway
 from app.config import Settings
 from app.database import Base, build_engine
 from app.models import Patient, Study
@@ -23,6 +23,7 @@ def client(tmp_path, monkeypatch):
         admin_password="admin-password",
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
         session_cookie_secure=False,
+        remote_access_mode="inbound_lab",
         vnc_gateway_ca_cert_file=(tmp_path / "gateway-ca.crt").resolve(),
     )
     settings.vnc_gateway_ca_cert_file.write_text("-----BEGIN CERTIFICATE-----\ntest-public-gateway-ca\n-----END CERTIFICATE-----\n", encoding="utf-8")
@@ -35,6 +36,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(security, "get_settings", lambda: settings)
     monkeypatch.setattr(vnc_gateway, "get_settings", lambda: settings)
     monkeypatch.setattr(machine_admin, "get_settings", lambda: settings)
+    monkeypatch.setattr(remote_sessions, "get_settings", lambda: settings)
     Base.metadata.create_all(engine)
     with TestClient(main.app) as test_client:
         yield test_client

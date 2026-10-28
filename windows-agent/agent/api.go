@@ -17,16 +17,18 @@ import (
 )
 
 type Config struct {
-	ServerURL            string `json:"server_url"`
-	MachineCode          string `json:"machine_code"`
-	AgentKey             string `json:"agent_key"`
-	UIToken              string `json:"ui_token"`
-	TunnelListen         string `json:"tunnel_listen,omitempty"`
-	TunnelCertificate    string `json:"tunnel_certificate,omitempty"`
-	TunnelPrivateKey     string `json:"tunnel_private_key,omitempty"`
-	GatewayCACertificate string `json:"gateway_ca_certificate,omitempty"`
-	VNCAddress           string `json:"vnc_address,omitempty"`
-	VNCPassword          string `json:"vnc_password,omitempty"`
+	ServerURL             string `json:"server_url"`
+	MachineCode           string `json:"machine_code"`
+	AgentKey              string `json:"agent_key"`
+	UIToken               string `json:"ui_token"`
+	TunnelListen          string `json:"tunnel_listen,omitempty"`
+	TunnelCertificate     string `json:"tunnel_certificate,omitempty"`
+	TunnelPrivateKey      string `json:"tunnel_private_key,omitempty"`
+	GatewayCACertificate  string `json:"gateway_ca_certificate,omitempty"`
+	VNCAddress            string `json:"vnc_address,omitempty"`
+	VNCPassword           string `json:"vnc_password,omitempty"`
+	RemoteAccessMode      string `json:"remote_access_mode,omitempty"`
+	AllowInsecureLoopback bool   `json:"allow_insecure_loopback,omitempty"`
 }
 
 type Session struct {
@@ -89,7 +91,7 @@ func Enroll(serverURL, machineCode, enrollmentToken, certificatePEM string) (Enr
 	if err = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result); err != nil {
 		return result, err
 	}
-	if len(result.AgentKey) < 32 || !strings.Contains(result.GatewayCACertificate, "CERTIFICATE") {
+	if len(result.AgentKey) < 32 {
 		return result, errors.New("enrollment response is incomplete")
 	}
 	return result, nil
@@ -216,6 +218,7 @@ type RuntimeState struct {
 	uiToken    string
 	authorizer *TunnelAuthorizer
 	pendingEnd string
+	persistEnd func(string) error
 	snapshot   Snapshot
 }
 
@@ -243,6 +246,15 @@ func (s *RuntimeState) SetSession(session *Session) {
 	}
 	s.snapshot.Session = session
 	if session == nil {
+		s.snapshot.Messages = []Message{}
+	}
+	s.mu.Unlock()
+}
+
+func (s *RuntimeState) ClearSession(sessionID string) {
+	s.mu.Lock()
+	if s.snapshot.Session != nil && s.snapshot.Session.ID == sessionID {
+		s.snapshot.Session = nil
 		s.snapshot.Messages = []Message{}
 	}
 	s.mu.Unlock()
@@ -292,7 +304,38 @@ func (s *RuntimeState) PendingEnd() string {
 	return s.pendingEnd
 }
 
+func (s *RuntimeState) SetPendingEndPersistence(pending string, persist func(string) error) {
+	s.mu.Lock()
+	s.pendingEnd = pending
+	s.persistEnd = persist
+	s.mu.Unlock()
+}
+
+func (s *RuntimeState) setPendingEnd(sessionID string) error {
+	s.mu.RLock()
+	persist := s.persistEnd
+	s.mu.RUnlock()
+	err := error(nil)
+	if persist != nil {
+		err = persist(sessionID)
+	}
+	s.mu.Lock()
+	s.pendingEnd = sessionID
+	s.mu.Unlock()
+	return err
+}
+
 func (s *RuntimeState) clearPendingEnd(sessionID string) {
+	s.mu.RLock()
+	if s.pendingEnd != sessionID {
+		s.mu.RUnlock()
+		return
+	}
+	persist := s.persistEnd
+	s.mu.RUnlock()
+	if persist != nil && persist("") != nil {
+		return
+	}
 	s.mu.Lock()
 	if s.pendingEnd == sessionID {
 		s.pendingEnd = ""
@@ -345,12 +388,15 @@ func (s *RuntimeState) Handler(client *Client) http.Handler {
 			http.Error(w, "no active session", http.StatusConflict)
 			return
 		}
-		s.pendingEnd = session.ID
 		s.snapshot.Session = nil
 		s.snapshot.Messages = []Message{}
 		s.mu.Unlock()
 		if s.authorizer != nil {
 			s.authorizer.Revoke(session.ID)
+		}
+		if err := s.setPendingEnd(session.ID); err != nil {
+			http.Error(w, "unable to persist end request", http.StatusInternalServerError)
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})))

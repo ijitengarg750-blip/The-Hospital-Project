@@ -10,7 +10,7 @@ import pytest
 
 from app.config import Settings
 from app.models import Machine
-from app.vnc_gateway import GatewayConfigurationError, MachineVncTarget, authenticate_vnc, load_machine_target, mint_tunnel_ticket, open_secure_transport, probe_secure_transport
+from app.vnc_gateway import GatewayConfigurationError, MachineVncTarget, authenticate_vnc, load_machine_target, mint_tunnel_ticket, open_secure_transport, probe_secure_transport, validate_tunnel_ticket
 
 
 class ScriptedSocket:
@@ -78,7 +78,8 @@ def test_secure_transport_fails_closed_without_both_peer_certificates(tmp_path):
 
 
 def test_tunnel_ticket_is_short_lived_session_specific_and_contains_no_agent_key():
-    ticket = mint_tunnel_ticket("session-1", sha256(b"agent-secret").hexdigest())
+    key_hash = sha256(b"agent-secret").hexdigest()
+    ticket = mint_tunnel_ticket("session-1", key_hash)
 
     encoded_payload, encoded_mac = ticket.split(".")
     payload_bytes = base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
@@ -89,6 +90,9 @@ def test_tunnel_ticket_is_short_lived_session_specific_and_contains_no_agent_key
     assert nonce
     assert encoded_mac
     assert "agent-secret" not in ticket
+    assert validate_tunnel_ticket("session-1", ticket, key_hash)
+    assert not validate_tunnel_ticket("session-2", ticket, key_hash)
+    assert not validate_tunnel_ticket("session-1", ticket + "x", key_hash)
 
 
 def test_secure_transport_sends_session_ticket_before_accepting_ready(monkeypatch):

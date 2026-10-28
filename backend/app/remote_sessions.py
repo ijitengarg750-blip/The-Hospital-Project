@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column, selectinload
 
 from .database import Base, get_db
+from .config import get_settings
 from .models import AuditLog, Machine, Study, utcnow
 from .security import AuthenticatedUser, current_user
 
@@ -127,19 +128,94 @@ def _expire(session: RemoteSession, now: datetime) -> bool:
     return False
 
 
+def fail_machine_sessions(machine_id: int, reason: str) -> None:
+    from . import database
+
+    now = utcnow()
+    with database.SessionLocal() as db:
+        sessions = list(db.scalars(select(RemoteSession).where(
+            RemoteSession.machine_id == machine_id,
+            RemoteSession.active_slot.is_(True),
+        )))
+        for session in sessions:
+            session.status = "failed"
+            session.active_slot = None
+            session.ended_at = now
+            session.end_reason = reason
+            db.add(AuditLog(username=f"agent:{machine_id}", action="remote.session.fail", resource=f"session:{session.id};reason:{reason}"))
+        if sessions:
+            db.commit()
+
+
+def reconcile_remote_sessions_on_startup() -> None:
+    from . import database
+
+    now = utcnow()
+    with database.SessionLocal() as db:
+        sessions = list(db.scalars(select(RemoteSession).where(RemoteSession.active_slot.is_(True))))
+        for session in sessions:
+            session.status = "failed"
+            session.active_slot = None
+            session.ended_at = now
+            session.end_reason = "server_restart"
+            db.add(AuditLog(username="system", action="remote.session.reconcile", resource=f"session:{session.id};reason:server_restart"))
+        if sessions:
+            db.commit()
+
+
+def cleanup_stale_remote_sessions() -> None:
+    from . import database
+
+    now = utcnow()
+    closed_session_ids: list[str] = []
+    with database.SessionLocal() as db:
+        changed = False
+        for session in db.scalars(select(RemoteSession).where(RemoteSession.active_slot.is_(True))):
+            if _expire(session, now):
+                db.add(AuditLog(username="system", action="remote.session.expire", resource=f"session:{session.id}"))
+                changed = True
+                closed_session_ids.append(session.id)
+                continue
+            identity = db.scalar(select(MachineAgent).where(MachineAgent.machine_id == session.machine_id))
+            if (
+                get_settings().remote_access_mode == "outbound"
+                and (not identity or not identity.last_seen_at or now - _as_utc(identity.last_seen_at) > AGENT_ONLINE_WINDOW)
+            ):
+                session.status = "failed"
+                session.active_slot = None
+                session.ended_at = now
+                session.end_reason = "heartbeat_expired"
+                db.add(AuditLog(username="system", action="remote.session.fail", resource=f"session:{session.id};reason:heartbeat_expired"))
+                changed = True
+                closed_session_ids.append(session.id)
+        if changed:
+            db.commit()
+    if closed_session_ids:
+        from .outbound_gateway import outbound_hub
+        for session_id in closed_session_ids:
+            outbound_hub.close_data(session_id, "session expired")
+
+
 def _agent_for_request(
     x_machine_code: str = Header(default=""),
     x_agent_key: str = Header(default=""),
     db: Session = Depends(get_db),
 ) -> MachineAgent:
+    identity = authenticate_agent(x_machine_code, x_agent_key, db)
+    if not identity:
+        raise HTTPException(401, "Invalid machine credentials")
+    return identity
+
+
+def authenticate_agent(machine_code: str, agent_key: str, db: Session) -> MachineAgent | None:
     identity = db.scalar(
         select(MachineAgent)
         .join(Machine, Machine.id == MachineAgent.machine_id)
-        .where(Machine.code == x_machine_code, Machine.active.is_(True))
+        .where(Machine.code == machine_code, Machine.active.is_(True))
     )
-    supplied_hash = sha256(x_agent_key.encode()).hexdigest()
+    supplied_hash = sha256(agent_key.encode()).hexdigest()
     if not identity or not hmac.compare_digest(identity.key_hash, supplied_hash):
-        raise HTTPException(401, "Invalid machine credentials")
+        return None
     return identity
 
 
@@ -201,6 +277,9 @@ def create_remote_session(
     user: AuthenticatedUser = Depends(current_user),
     db: Session = Depends(get_db),
 ):
+    mode = get_settings().remote_access_mode
+    if mode == "disabled":
+        raise HTTPException(503, "Remote access is disabled")
     now = utcnow()
     study = db.scalar(select(Study).where(Study.id == study_id).options(selectinload(Study.machine)))
     if not study or not study.machine.active:
@@ -214,7 +293,17 @@ def create_remote_session(
         if not permitted:
             raise HTTPException(403, "You do not have access to this diagnostic machine")
     identity = db.scalar(select(MachineAgent).where(MachineAgent.machine_id == study.machine_id))
-    if not identity or not identity.last_seen_at or now - _as_utc(identity.last_seen_at) > AGENT_ONLINE_WINDOW:
+    if not identity:
+        raise HTTPException(409, "Machine agent is offline")
+    if mode == "outbound":
+        from .outbound_gateway import outbound_hub
+        if (
+            not outbound_hub.is_connected(study.machine_id)
+            or not identity.last_seen_at
+            or now - _as_utc(identity.last_seen_at) > AGENT_ONLINE_WINDOW
+        ):
+            raise HTTPException(409, "Outbound connector is offline")
+    elif not identity.last_seen_at or now - _as_utc(identity.last_seen_at) > AGENT_ONLINE_WINDOW:
         raise HTTPException(409, "Machine agent is offline")
     if identity.state in {"busy", "booting", "unavailable"}:
         raise HTTPException(409, f"Machine is {identity.state}")
@@ -247,6 +336,18 @@ def create_remote_session(
         db.rollback()
         raise HTTPException(409, "Another remote session is active for this machine") from exc
     db.refresh(session)
+    if mode == "outbound":
+        from .outbound_gateway import outbound_hub
+        from .vnc_gateway import mint_tunnel_ticket
+        data_ticket = mint_tunnel_ticket(session.id, identity.key_hash)
+        if not outbound_hub.dispatch(session.machine_id, {"type": "session_request", "session_id": session.id, "data_ticket": data_ticket}):
+            session.status = "failed"
+            session.active_slot = None
+            session.ended_at = utcnow()
+            session.end_reason = "connector_disconnected"
+            db.add(AuditLog(username=user, action="remote.session.fail", resource=f"session:{session.id};reason:connector_disconnected"))
+            db.commit()
+            raise HTTPException(409, "Outbound connector disconnected")
     return {"session": session, "connection_grant": grant}
 
 
@@ -332,6 +433,9 @@ def end_remote_session(
         session.end_reason = "doctor"
         db.add(AuditLog(username=user, action="remote.session.end", resource=f"session:{session.id};reason:doctor"))
         db.commit()
+        if get_settings().remote_access_mode == "outbound":
+            from .outbound_gateway import outbound_hub
+            outbound_hub.dispatch(session.machine_id, {"type": "session_end", "session_id": session.id})
     return session
 
 

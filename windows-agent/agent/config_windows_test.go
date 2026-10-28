@@ -28,3 +28,21 @@ func TestConfigIsDPAPIProtectedAndRoundTripsOnThisWindowsMachine(t *testing.T) {
 		t.Fatalf("got=%+v want=%+v", got, want)
 	}
 }
+
+func TestPendingEndIsDPAPIProtectedAndRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pending.dat")
+	if err := SavePendingEnd(path, "session-1"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("session-1")) {
+		t.Fatal("pending end session was stored in plaintext")
+	}
+	got, err := LoadPendingEnd(path)
+	if err != nil || got != "session-1" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+}

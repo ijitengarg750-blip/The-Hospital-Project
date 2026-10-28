@@ -1,4 +1,6 @@
-# Two-laptop encrypted remote-access test
+# Two-laptop encrypted remote-access test (Phase 1 inbound lab baseline)
+
+This checklist intentionally remains available as the Phase 1 comparison baseline. It is not the Phase 2 outbound production design and its inbound TCP 5910 rule must not be carried into an outbound deployment.
 
 This is a supervised, non-production acceptance run using synthetic data and a test-only Windows/VNC account. It does not install or configure a VPN.
 

@@ -13,6 +13,6 @@ This package is for a supervised Windows 11 functional test with synthetic data.
 
 Run `Install-Agent.ps1` from an elevated PowerShell window with the dashboard HTTPS URL, registered machine code, and UI account. The installer prompts for the one-time enrollment token and VNC password without echoing them.
 
-Do not expose ports 5900 or 5910 to the internet. If port 5910 is required for the current inbound pilot design, restrict it to the dashboard server's private IP.
+The packaged Phase 1 executable remains an inbound, lab-only comparison artifact. Do not expose ports 5900 or 5910 to the internet. If port 5910 is required for that lab comparison, restrict it to the dashboard server's private IP. Phase 2 outbound mode must not install or retain an inbound 5910 rule.
 
 The self-signed certificate proves package integrity only after the public certificate has been deliberately trusted. It does not prove that the code is safe, does not override WDAC/App Control, and is not a production identity.

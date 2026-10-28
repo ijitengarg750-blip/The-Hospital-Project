@@ -123,6 +123,19 @@ def mint_tunnel_ticket(session_id: str, agent_key_hash: str) -> str:
     )
 
 
+def validate_tunnel_ticket(session_id: str, ticket: str, agent_key_hash: str) -> bool:
+    try:
+        encoded_payload, encoded_signature = ticket.split(".", 1)
+        payload = base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
+        signature = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        claims = payload.decode().split("\n")
+        expected = hmac.new(bytes.fromhex(agent_key_hash), payload, sha256).digest()
+        remaining = int(claims[1]) - int(time.time())
+        return len(claims) == 3 and claims[0] == session_id and bool(claims[2]) and 0 <= remaining <= 35 and hmac.compare_digest(signature, expected)
+    except (ValueError, UnicodeDecodeError, IndexError):
+        return False
+
+
 def _open_secure_channel(machine: Machine, network: Any, settings) -> ssl.SSLSocket:
     if (
         not network
@@ -219,6 +232,11 @@ async def _tcp_to_websocket(upstream: socket.socket, websocket: WebSocket) -> No
         await websocket.send_bytes(payload)
 
 
+async def _websocket_to_websocket(source: WebSocket, target: WebSocket) -> None:
+    while True:
+        await target.send_bytes(await source.receive_bytes())
+
+
 async def _watch_session(session_id: str) -> None:
     while True:
         await asyncio.sleep(1)
@@ -255,16 +273,32 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
         db.add(AuditLog(username=session.doctor_username, action="remote.gateway.connect", resource=f"session:{session.id};machine:{machine_code}"))
         db.commit()
     upstream = None
+    outbound = None
     end_reason = "gateway_disconnected"
     try:
-        upstream = await asyncio.to_thread(open_secure_transport, machine, network, settings, session_id, tunnel_ticket)
+        if settings.remote_access_mode == "outbound":
+            from .outbound_gateway import outbound_hub
+            outbound = await outbound_hub.claim_data(session_id)
+            if not outbound:
+                raise GatewayConfigurationError("Authorized outbound data stream is unavailable")
+        elif settings.remote_access_mode == "inbound_lab":
+            upstream = await asyncio.to_thread(open_secure_transport, machine, network, settings, session_id, tunnel_ticket)
+        else:
+            raise GatewayConfigurationError("Remote access transport is disabled")
         await websocket.accept(subprotocol=protocol)
         await _browser_handshake(websocket)
-        tasks = {
-            asyncio.create_task(_websocket_to_tcp(websocket, upstream)),
-            asyncio.create_task(_tcp_to_websocket(upstream, websocket)),
-            asyncio.create_task(_watch_session(session_id)),
-        }
+        if outbound:
+            tasks = {
+                asyncio.create_task(_websocket_to_websocket(websocket, outbound.websocket)),
+                asyncio.create_task(_websocket_to_websocket(outbound.websocket, websocket)),
+                asyncio.create_task(_watch_session(session_id)),
+            }
+        else:
+            tasks = {
+                asyncio.create_task(_websocket_to_tcp(websocket, upstream)),
+                asyncio.create_task(_tcp_to_websocket(upstream, websocket)),
+                asyncio.create_task(_watch_session(session_id)),
+            }
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
@@ -282,6 +316,9 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
     finally:
         if upstream:
             upstream.close()
+        if outbound:
+            from .outbound_gateway import outbound_hub
+            outbound_hub.release_data(session_id, outbound)
         with database.SessionLocal() as db:
             session = db.get(RemoteSession, session_id)
             if session and session.active_slot and session.status == "connected":

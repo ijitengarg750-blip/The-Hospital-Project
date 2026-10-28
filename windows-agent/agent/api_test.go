@@ -132,6 +132,35 @@ func TestOfflineLocalEndRevokesFirstAndReturnsSuccess(t *testing.T) {
 	}
 }
 
+func TestOfflineLocalEndSurvivesRuntimeRestart(t *testing.T) {
+	stored := ""
+	state := NewRuntimeState("ui-secret", nil)
+	state.SetPendingEndPersistence("", func(sessionID string) error { stored = sessionID; return nil })
+	state.SetSession(&Session{ID: "session-1", Status: "connected"})
+	request := httptest.NewRequest(http.MethodPost, "/end", nil)
+	request.Header.Set("Authorization", "Bearer ui-secret")
+	recorder := httptest.NewRecorder()
+
+	state.Handler(nil).ServeHTTP(recorder, request)
+	restarted := NewRuntimeState("ui-secret", nil)
+	restarted.SetPendingEndPersistence(stored, func(sessionID string) error { stored = sessionID; return nil })
+
+	if recorder.Code != http.StatusNoContent || restarted.PendingEnd() != "session-1" {
+		t.Fatalf("status=%d persisted=%q", recorder.Code, restarted.PendingEnd())
+	}
+}
+
+func TestOlderDataCompletionDoesNotClearNewerSession(t *testing.T) {
+	state := NewRuntimeState("ui-secret", nil)
+	state.SetSession(&Session{ID: "session-2", Status: "ready"})
+
+	state.ClearSession("session-1")
+
+	if session := state.Snapshot().Session; session == nil || session.ID != "session-2" {
+		t.Fatalf("session=%+v", session)
+	}
+}
+
 func TestOfflineLocalEndDoesNotWaitForDashboardTimeout(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

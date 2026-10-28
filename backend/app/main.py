@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import asyncio
+from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
 import tempfile
@@ -20,9 +22,10 @@ from .ingestion import ingest_upload
 from .dicom_import import role_for_member
 from .models import AuditLog, AuthAttempt, ClinicalFile, DicomObject, Machine, Patient, Study, utcnow
 from .phoenix_reports import PhoenixReportError, dicom_has_phoenix_report, render_dicom_report
-from .remote_sessions import router as remote_sessions_router
+from .remote_sessions import cleanup_stale_remote_sessions, reconcile_remote_sessions_on_startup, router as remote_sessions_router
 from .machine_admin import MachinePermission, require_machine_access, router as machine_admin_router
 from .vnc_gateway import router as vnc_gateway_router
+from .outbound_gateway import router as outbound_gateway_router
 from .schemas import FileOut, LoginRequest, MachineOut, PatientOut, PhoenixReportOut, RemoteAccessUpdate, ReportTypeUpdate, StudyInventoryOut
 from .security import AuthenticatedUser, authenticate, authenticate_collector_machine, create_token, current_user, require_admin
 
@@ -32,6 +35,7 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credent
 app.include_router(remote_sessions_router)
 app.include_router(machine_admin_router)
 app.include_router(vnc_gateway_router)
+app.include_router(outbound_gateway_router)
 
 
 def _authenticate_collector_headers(machine_code: str, collector_key: str) -> str | None:
@@ -56,6 +60,27 @@ async def authenticate_collector_before_reading_upload(request: Request, call_ne
 def startup():
     settings.storage_root.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
+    reconcile_remote_sessions_on_startup()
+
+
+async def _remote_cleanup_loop():
+    while True:
+        await asyncio.sleep(15)
+        await run_in_threadpool(cleanup_stale_remote_sessions)
+
+
+@app.on_event("startup")
+async def start_remote_cleanup():
+    app.state.remote_cleanup_task = asyncio.create_task(_remote_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def stop_remote_cleanup():
+    task = getattr(app.state, "remote_cleanup_task", None)
+    if task:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 @app.get("/api/health")

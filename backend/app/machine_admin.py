@@ -241,12 +241,14 @@ def enroll_agent(payload: EnrollmentIn, response: Response, db: Session = Depend
         ).with_for_update())
     if not enrollment or _as_utc(enrollment.expires_at) <= now:
         raise HTTPException(401, "Invalid or expired enrollment")
-    ca_file = get_settings().vnc_gateway_ca_cert_file
-    if not ca_file or not ca_file.is_absolute() or not ca_file.is_file():
-        raise HTTPException(503, "Gateway identity is not configured")
-    ca_certificate = ca_file.read_text(encoding="utf-8")
-    if "PRIVATE KEY" in ca_certificate or ca_certificate.count("-----BEGIN CERTIFICATE-----") != 1 or ca_certificate.count("-----END CERTIFICATE-----") != 1:
-        raise HTTPException(503, "Gateway public CA certificate is invalid")
+    ca_certificate = ""
+    if get_settings().remote_access_mode == "inbound_lab":
+        ca_file = get_settings().vnc_gateway_ca_cert_file
+        if not ca_file or not ca_file.is_absolute() or not ca_file.is_file():
+            raise HTTPException(503, "Gateway identity is not configured")
+        ca_certificate = ca_file.read_text(encoding="utf-8")
+        if "PRIVATE KEY" in ca_certificate or ca_certificate.count("-----BEGIN CERTIFICATE-----") != 1 or ca_certificate.count("-----END CERTIFICATE-----") != 1:
+            raise HTTPException(503, "Gateway public CA certificate is invalid")
     key = secrets.token_urlsafe(32)
     identity = db.scalar(select(MachineAgent).where(MachineAgent.machine_id == machine.id))
     if identity:
@@ -256,6 +258,8 @@ def enroll_agent(payload: EnrollmentIn, response: Response, db: Session = Depend
     else:
         db.add(MachineAgent(machine_id=machine.id, key_hash=sha256(key.encode()).hexdigest()))
     if payload.agent_certificate_pem:
+        if get_settings().remote_access_mode != "inbound_lab":
+            raise HTTPException(422, "Agent listener certificates are only accepted in inbound_lab mode")
         network = db.get(MachineNetwork, machine.id)
         if not network:
             raise HTTPException(409, "Configure the machine network before enrollment")

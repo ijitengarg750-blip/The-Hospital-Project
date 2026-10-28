@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -97,8 +98,15 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 	defer cancel()
 	windowsState := agent.NewWindowsState()
 	client := agent.NewClient(config)
-	authorizer := agent.NewTunnelAuthorizer(config.AgentKey)
+	var authorizer *agent.TunnelAuthorizer
+	if config.RemoteAccessMode == "inbound_lab" {
+		authorizer = agent.NewTunnelAuthorizer(config.AgentKey)
+	}
 	runtimeState := agent.NewRuntimeState(config.UIToken, authorizer)
+	if err = configurePendingEndPersistence(runtimeState, handler.configPath+".pending"); err != nil {
+		logServiceError(logger, "load pending end state", err)
+		return true, 1
+	}
 	localFailures, err := startLocalControl(ctx, runtimeState.Handler(client))
 	localHealthy := err == nil
 	if !localHealthy {
@@ -107,7 +115,7 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 	}
 	var tunnelFailures <-chan error
 	tunnelHealthy := false
-	if config.TunnelListen != "" {
+	if config.RemoteAccessMode == "inbound_lab" && config.TunnelListen != "" {
 		tunnelFailures, err = startTunnel(ctx, config, authorizer)
 		tunnelHealthy = err == nil
 		if !tunnelHealthy {
@@ -117,7 +125,7 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 	}
 	agentFailures := make(chan error, 1)
 	go func() {
-		agentFailures <- agent.Run(ctx, client, runtimeState, windowsState.Get, vncReadiness(config), authorizer)
+		agentFailures <- runRemoteConnector(ctx, config, client, runtimeState, windowsState.Get, authorizer)
 	}()
 	componentEvents := make(chan componentEvent, 8)
 	runtimeState.SetComponent("agent_loop", "healthy", "")
@@ -140,7 +148,7 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 	go superviseComponent(ctx, "agent_loop", agentFailures, func() (<-chan error, error) {
 		failures := make(chan error, 1)
 		go func() {
-			failures <- agent.Run(ctx, client, runtimeState, windowsState.Get, vncReadiness(config), authorizer)
+			failures <- runRemoteConnector(ctx, config, client, runtimeState, windowsState.Get, authorizer)
 		}()
 		return failures, nil
 	}, 2*time.Second, componentEvents)
@@ -201,6 +209,32 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 			}
 		}
 	}
+}
+
+func runRemoteConnector(ctx context.Context, config agent.Config, client *agent.Client, state *agent.RuntimeState, machineState func() string, authorizer *agent.TunnelAuthorizer) error {
+	switch config.RemoteAccessMode {
+	case "outbound":
+		state.SetComponent("secure_tunnel", "disabled", "")
+		return agent.RunOutbound(ctx, config, state, machineState)
+	case "inbound_lab":
+		return agent.Run(ctx, client, state, machineState, vncReadiness(config), authorizer)
+	default:
+		return errors.New("remote_access_mode must be outbound or inbound_lab")
+	}
+}
+
+func configurePendingEndPersistence(state *agent.RuntimeState, path string) error {
+	pending, err := agent.LoadPendingEnd(path)
+	if err != nil {
+		return err
+	}
+	var mu sync.Mutex
+	state.SetPendingEndPersistence(pending, func(sessionID string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return agent.SavePendingEnd(path, sessionID)
+	})
+	return nil
 }
 
 func logServiceError(logger *eventlog.Log, component string, err error) {
@@ -270,13 +304,26 @@ func install(args []string) error {
 	server := flags.String("server", "", "dashboard base URL (HTTPS required outside localhost)")
 	machine := flags.String("machine", "", "registered machine code")
 	uiUser := flags.String("ui-user", "", "Windows account allowed to run the notification UI")
-	tunnelListen := flags.String("tunnel-listen", "0.0.0.0:5910", "mutual-TLS tunnel listen address")
+	tunnelListen := flags.String("tunnel-listen", "", "lab-only mutual-TLS tunnel listen address")
+	remoteMode := flags.String("remote-mode", "outbound", "remote transport: outbound or inbound_lab")
 	vncAddress := flags.String("vnc-address", "127.0.0.1:5900", "loopback VNC server address")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *server == "" || *machine == "" || *uiUser == "" {
 		return errors.New("--server, --machine, and --ui-user are required")
+	}
+	if *remoteMode != "outbound" && *remoteMode != "inbound_lab" {
+		return errors.New("--remote-mode must be outbound or inbound_lab")
+	}
+	if *remoteMode == "inbound_lab" && *tunnelListen == "" {
+		return errors.New("--tunnel-listen is required for inbound_lab mode")
+	}
+	if *remoteMode == "outbound" {
+		*tunnelListen = ""
+		if err := agent.ValidateOutboundServerURL(*server); err != nil {
+			return err
+		}
 	}
 	if !strings.HasPrefix(*server, "https://") && !strings.HasPrefix(*server, "http://localhost") && !strings.HasPrefix(*server, "http://127.0.0.1") {
 		return errors.New("server must use HTTPS")
@@ -312,9 +359,12 @@ func install(args []string) error {
 	if len([]byte(vncPassword)) < 1 || len([]byte(vncPassword)) > 8 {
 		return errors.New("VNC password must be 1 to 8 bytes")
 	}
-	certificate, privateKey, err := agent.GenerateMachineIdentity(*machine)
-	if err != nil {
-		return err
+	certificate, privateKey := "", ""
+	if *remoteMode == "inbound_lab" {
+		certificate, privateKey, err = agent.GenerateMachineIdentity(*machine)
+		if err != nil {
+			return err
+		}
 	}
 	enrollment, err := agent.Enroll(*server, *machine, token, certificate)
 	if err != nil {
@@ -328,10 +378,15 @@ func install(args []string) error {
 		ServerURL: *server, MachineCode: *machine, AgentKey: enrollment.AgentKey, UIToken: randomToken(),
 		TunnelListen: *tunnelListen, TunnelCertificate: certificate, TunnelPrivateKey: privateKey,
 		GatewayCACertificate: enrollment.GatewayCACertificate, VNCAddress: *vncAddress, VNCPassword: vncPassword,
+		RemoteAccessMode: *remoteMode,
 	}
 	serviceConfig := filepath.Join(directory, "service.dat")
+	pendingEnd := serviceConfig + ".pending"
 	uiConfig := filepath.Join(directory, "ui.dat")
 	if err := agent.SaveConfig(serviceConfig, config); err != nil {
+		return err
+	}
+	if err := agent.SavePendingEnd(pendingEnd, ""); err != nil {
 		return err
 	}
 	if err := agent.SaveConfig(uiConfig, agent.Config{UIToken: config.UIToken}); err != nil {
@@ -339,6 +394,9 @@ func install(args []string) error {
 	}
 	if err := exec.Command("icacls", serviceConfig, "/inheritance:r", "/grant:r", "SYSTEM:F", "Administrators:F").Run(); err != nil {
 		return fmt.Errorf("secure service config ACL: %w", err)
+	}
+	if err := exec.Command("icacls", pendingEnd, "/inheritance:r", "/grant:r", "SYSTEM:F", "Administrators:F").Run(); err != nil {
+		return fmt.Errorf("secure pending end ACL: %w", err)
 	}
 	if err := exec.Command("icacls", uiConfig, "/inheritance:r", "/grant:r", "SYSTEM:F", "Administrators:F", *uiUser+":R").Run(); err != nil {
 		return fmt.Errorf("secure UI config ACL: %w", err)
@@ -390,8 +448,14 @@ func runConsole(configPath string) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	authorizer := agent.NewTunnelAuthorizer(config.AgentKey)
+	var authorizer *agent.TunnelAuthorizer
+	if config.RemoteAccessMode == "inbound_lab" {
+		authorizer = agent.NewTunnelAuthorizer(config.AgentKey)
+	}
 	state := agent.NewRuntimeState(config.UIToken, authorizer)
+	if err = configurePendingEndPersistence(state, configPath+".pending"); err != nil {
+		return err
+	}
 	client := agent.NewClient(config)
 	localFailures, err := startLocalControl(ctx, state.Handler(client))
 	if err != nil {
@@ -399,7 +463,7 @@ func runConsole(configPath string) error {
 	}
 	state.SetComponent("local_control", "healthy", "")
 	var tunnelFailures <-chan error
-	if config.TunnelListen != "" {
+	if config.RemoteAccessMode == "inbound_lab" && config.TunnelListen != "" {
 		tunnelFailures, err = startTunnel(ctx, config, authorizer)
 		if err != nil {
 			return err
@@ -411,7 +475,7 @@ func runConsole(configPath string) error {
 	state.SetComponent("agent_loop", "healthy", "")
 	agentFailures := make(chan error, 1)
 	go func() {
-		agentFailures <- agent.Run(ctx, client, state, agent.NewWindowsState().Get, vncReadiness(config), authorizer)
+		agentFailures <- runRemoteConnector(ctx, config, client, state, agent.NewWindowsState().Get, authorizer)
 	}()
 	select {
 	case err = <-localFailures:

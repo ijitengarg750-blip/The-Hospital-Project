@@ -38,7 +38,21 @@ Complete one copy per machine.
 ## Remote access validation
 
 - VNC server installed/configured: Yes / No
-- VNC restricted to hospital LAN/gateway: Yes / No
+- TightVNC bound to loopback only: Yes / No
+- Outbound production mode has no inbound TCP 5910 firewall rule: Yes / No
+- Stable dashboard hostname and trusted certificate validated: Yes / No
+- DHCP address changed without server configuration update: Yes / No
+- Wi-Fi outage/reconnection recovered automatically: Yes / No
+- Offline local End Session reconciled after connectivity returned: Yes / No
+- Remote Connector crash/restart recovered independently: Yes / No
+- Data Collector crash/restart recovered independently: Yes / No
+- TightVNC crash/restart did not stop unrelated components: Yes / No
+- Notification UI crash/restart recovered independently: Yes / No
+- Server restart reconciled stale sessions: Yes / No
+- Certificate rotation overlap and revocation tested: Yes / No
+- Final signed binaries authorized by WDAC policy: Yes / No
+- Changed deployment scripts re-signed and verified: Yes / No
+- Phase 1 inbound path used only for explicit lab comparison: Yes / No
 - noVNC URL configured: Yes / No
 - Open Live Software works: Yes / No
 - Remote password is not stored in dashboard/PostgreSQL: Confirmed / Not confirmed
