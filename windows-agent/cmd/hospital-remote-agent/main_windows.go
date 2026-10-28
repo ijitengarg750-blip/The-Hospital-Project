@@ -27,6 +27,61 @@ const serviceName = "HospitalRemoteAgent"
 
 type serviceHandler struct{ configPath string }
 
+type componentEvent struct {
+	name   string
+	status string
+	err    error
+}
+
+func componentFailure(err error) <-chan error {
+	failures := make(chan error, 1)
+	failures <- err
+	return failures
+}
+
+func superviseComponent(ctx context.Context, name string, failures <-chan error, start func() (<-chan error, error), retryDelay time.Duration, events chan<- componentEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-failures:
+			if err == nil {
+				err = errors.New("stopped unexpectedly")
+			}
+			select {
+			case events <- componentEvent{name: name, status: "degraded", err: err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		for {
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			var err error
+			failures, err = start()
+			if err != nil {
+				select {
+				case events <- componentEvent{name: name, status: "degraded", err: err}:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+			select {
+			case events <- componentEvent{name: name, status: "healthy"}:
+			case <-ctx.Done():
+				return
+			}
+			break
+		}
+	}
+}
+
 func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, statuses chan<- svc.Status) (bool, uint32) {
 	statuses <- svc.Status{State: svc.StartPending}
 	logger, _ := eventlog.Open(serviceName)
@@ -42,22 +97,56 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 	defer cancel()
 	windowsState := agent.NewWindowsState()
 	client := agent.NewClient(config)
-	runtimeState := agent.NewRuntimeState(config.UIToken)
+	authorizer := agent.NewTunnelAuthorizer(config.AgentKey)
+	runtimeState := agent.NewRuntimeState(config.UIToken, authorizer)
 	localFailures, err := startLocalControl(ctx, runtimeState.Handler(client))
-	if err != nil {
-		logServiceError(logger, "start local control", err)
-		return true, 1
+	localHealthy := err == nil
+	if !localHealthy {
+		localFailures = componentFailure(err)
+		runtimeState.SetComponent("local_control", "degraded", err.Error())
 	}
 	var tunnelFailures <-chan error
+	tunnelHealthy := false
 	if config.TunnelListen != "" {
-		tunnelFailures, err = startTunnel(ctx, config)
-		if err != nil {
-			logServiceError(logger, "start secure tunnel", err)
-			return true, 1
+		tunnelFailures, err = startTunnel(ctx, config, authorizer)
+		tunnelHealthy = err == nil
+		if !tunnelHealthy {
+			tunnelFailures = componentFailure(err)
+			runtimeState.SetComponent("secure_tunnel", "degraded", err.Error())
 		}
 	}
 	agentFailures := make(chan error, 1)
-	go func() { agentFailures <- agent.Run(ctx, client, runtimeState, windowsState.Get, vncReadiness(config)) }()
+	go func() {
+		agentFailures <- agent.Run(ctx, client, runtimeState, windowsState.Get, vncReadiness(config), authorizer)
+	}()
+	componentEvents := make(chan componentEvent, 8)
+	runtimeState.SetComponent("agent_loop", "healthy", "")
+	if localHealthy {
+		runtimeState.SetComponent("local_control", "healthy", "")
+	}
+	go superviseComponent(ctx, "local_control", localFailures, func() (<-chan error, error) {
+		return startLocalControl(ctx, runtimeState.Handler(client))
+	}, 2*time.Second, componentEvents)
+	if tunnelFailures != nil {
+		if tunnelHealthy {
+			runtimeState.SetComponent("secure_tunnel", "healthy", "")
+		}
+		go superviseComponent(ctx, "secure_tunnel", tunnelFailures, func() (<-chan error, error) {
+			return startTunnel(ctx, config, authorizer)
+		}, 2*time.Second, componentEvents)
+	} else {
+		runtimeState.SetComponent("secure_tunnel", "disabled", "")
+	}
+	go superviseComponent(ctx, "agent_loop", agentFailures, func() (<-chan error, error) {
+		failures := make(chan error, 1)
+		go func() {
+			failures <- agent.Run(ctx, client, runtimeState, windowsState.Get, vncReadiness(config), authorizer)
+		}()
+		return failures, nil
+	}, 2*time.Second, componentEvents)
+	healthTicker := time.NewTicker(15 * time.Second)
+	defer healthTicker.Stop()
+	lastHealth := make(map[string]string)
 	statuses <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange}
 	for {
 		select {
@@ -81,18 +170,35 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 					windowsState.Set("signed_out")
 				}
 			}
-		case err = <-localFailures:
-			logServiceError(logger, "local control stopped", err)
-			statuses <- svc.Status{State: svc.StopPending}
-			return true, 1
-		case err = <-tunnelFailures:
-			logServiceError(logger, "secure tunnel stopped", err)
-			statuses <- svc.Status{State: svc.StopPending}
-			return true, 1
-		case err = <-agentFailures:
-			logServiceError(logger, "agent loop stopped", err)
-			statuses <- svc.Status{State: svc.StopPending}
-			return true, 1
+		case event := <-componentEvents:
+			detail := ""
+			if event.err != nil {
+				detail = event.err.Error()
+			}
+			runtimeState.SetComponent(event.name, event.status, detail)
+			if logger != nil {
+				if event.status == "healthy" {
+					_ = logger.Info(2, event.name+": recovered")
+				} else {
+					_ = logger.Warning(2, event.name+": "+detail)
+				}
+			}
+		case <-healthTicker.C:
+			for name, health := range runtimeState.Snapshot().Components {
+				previous := lastHealth[name]
+				if health.Status == previous {
+					continue
+				}
+				lastHealth[name] = health.Status
+				if logger == nil {
+					continue
+				}
+				if health.Status == "degraded" {
+					_ = logger.Warning(3, name+": "+health.Error)
+				} else if health.Status == "healthy" && previous == "degraded" {
+					_ = logger.Info(3, name+": recovered")
+				}
+			}
 		}
 	}
 }
@@ -124,7 +230,7 @@ func startLocalControl(ctx context.Context, handler http.Handler) (<-chan error,
 	return failures, nil
 }
 
-func startTunnel(ctx context.Context, config agent.Config) (<-chan error, error) {
+func startTunnel(ctx context.Context, config agent.Config, authorizer *agent.TunnelAuthorizer) (<-chan error, error) {
 	if err := agent.ValidateTunnelConfig(config); err != nil {
 		return nil, err
 	}
@@ -133,7 +239,7 @@ func startTunnel(ctx context.Context, config agent.Config) (<-chan error, error)
 		return nil, err
 	}
 	failures := make(chan error, 1)
-	go func() { failures <- agent.ServeTunnel(ctx, listener, config) }()
+	go func() { failures <- agent.ServeTunnel(ctx, listener, config, authorizer) }()
 	return failures, nil
 }
 
@@ -284,22 +390,28 @@ func runConsole(configPath string) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	state := agent.NewRuntimeState(config.UIToken)
+	authorizer := agent.NewTunnelAuthorizer(config.AgentKey)
+	state := agent.NewRuntimeState(config.UIToken, authorizer)
 	client := agent.NewClient(config)
 	localFailures, err := startLocalControl(ctx, state.Handler(client))
 	if err != nil {
 		return err
 	}
+	state.SetComponent("local_control", "healthy", "")
 	var tunnelFailures <-chan error
 	if config.TunnelListen != "" {
-		tunnelFailures, err = startTunnel(ctx, config)
+		tunnelFailures, err = startTunnel(ctx, config, authorizer)
 		if err != nil {
 			return err
 		}
+		state.SetComponent("secure_tunnel", "healthy", "")
+	} else {
+		state.SetComponent("secure_tunnel", "disabled", "")
 	}
+	state.SetComponent("agent_loop", "healthy", "")
 	agentFailures := make(chan error, 1)
 	go func() {
-		agentFailures <- agent.Run(ctx, client, state, agent.NewWindowsState().Get, vncReadiness(config))
+		agentFailures <- agent.Run(ctx, client, state, agent.NewWindowsState().Get, vncReadiness(config), authorizer)
 	}()
 	select {
 	case err = <-localFailures:

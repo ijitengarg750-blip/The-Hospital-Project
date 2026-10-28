@@ -2,6 +2,7 @@
 """Create one harmless text-only study for the two-laptop remote-access test."""
 
 import argparse
+from getpass import getpass
 import ipaddress
 import json
 from pathlib import Path
@@ -49,9 +50,11 @@ def main() -> None:
     args = parser.parse_args()
     validate_dashboard_url(args.dashboard_url)
     collector_config = json.loads(args.collector_config.read_text(encoding="utf-8-sig"))
-    collector_key = collector_config.get("collector_key") if collector_config.get("machine_code") == args.machine_code else None
-    if not collector_key:
-        raise SystemExit("Collector config does not contain a credential for this machine")
+    if collector_config.get("machine_code") != args.machine_code:
+        raise SystemExit("Collector config belongs to a different machine")
+    collector_key = getpass("Per-machine collector credential: ").strip()
+    if len(collector_key) < 32:
+        raise SystemExit("Collector credential is too short")
 
     boundary = "hospital-test-" + secrets.token_hex(12)
     study_uid = f"REMOTE-ACCESS-TEST-{args.machine_code}"

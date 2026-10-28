@@ -42,8 +42,6 @@ Assert-ValidPilotSignature -Path $agentBinary -ExpectedThumbprint $expectedThumb
 Assert-ValidPilotSignature -Path $uiScript -ExpectedThumbprint $expectedThumbprint
 $account = New-Object Security.Principal.NTAccount $UIUser
 $sid = $account.Translate([Security.Principal.SecurityIdentifier]).Value
-$profile = Get-WmiObject Win32_UserProfile | Where-Object { $_.SID -eq $sid } | Select-Object -First 1
-if (-not $profile -or -not $profile.LocalPath) { throw 'The UI user must sign in once before installation so its Windows profile exists.' }
 New-Item -ItemType Directory -Path $destination -Force | Out-Null
 Copy-Item $agentBinary (Join-Path $destination 'hospital-remote-agent.exe') -Force
 Copy-Item $uiScript $destination -Force
@@ -52,23 +50,30 @@ Write-Host 'Paste the one-time enrollment token when prompted. Input is hidden.'
 & (Join-Path $destination 'hospital-remote-agent.exe') install --server $Server --machine $MachineCode --ui-user $UIUser
 if ($LASTEXITCODE -ne 0) { throw 'Agent service installation failed.' }
 
-$startup = Join-Path $profile.LocalPath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
-New-Item -ItemType Directory -Path $startup -Force | Out-Null
-$launcher = Join-Path $startup 'HospitalRemoteUI.lnk'
 $powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($launcher)
-$shortcut.TargetPath = $powerShell
-$shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy AllSigned -File `"$destination\HospitalRemoteUI.ps1`""
-$shortcut.WorkingDirectory = $destination
-$shortcut.Save()
-$launcherRecord = Join-Path (Join-Path $env:ProgramData 'HospitalRemoteAgent') 'ui-launcher-path.txt'
-[IO.File]::WriteAllText($launcherRecord, $launcher, [Text.Encoding]::Unicode)
-icacls $launcherRecord /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' | Out-Null
+$taskService = New-Object -ComObject 'Schedule.Service'
+$taskService.Connect()
+$taskFolder = $taskService.GetFolder('\')
+$task = $taskService.NewTask(0)
+$task.RegistrationInfo.Description = 'Shows local remote-session notices and the offline emergency stop.'
+$task.Principal.UserId = $UIUser
+$task.Principal.LogonType = 3
+$task.Principal.RunLevel = 0
+$trigger = $task.Triggers.Create(9)
+$trigger.UserId = $UIUser
+$trigger.Enabled = $true
+$action = $task.Actions.Create(0)
+$action.Path = $powerShell
+$action.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy AllSigned -File `"$destination\HospitalRemoteUI.ps1`""
+$action.WorkingDirectory = $destination
+$task.Settings.RestartCount = 5
+$task.Settings.RestartInterval = 'PT1M'
+$task.Settings.ExecutionTimeLimit = 'PT0S'
+$taskFolder.RegisterTaskDefinition('Hospital Remote Notification UI', $task, 6, $UIUser, $null, 3, $null) | Out-Null
 if ($identity.User.Value -eq $sid) {
-  Start-Process -FilePath $launcher
+	$taskFolder.GetTask('Hospital Remote Notification UI').Run($null) | Out-Null
 }
-Write-Host 'Hospital Remote Agent installed. Sign in as the UI user once to start the notification application.'
+Write-Host 'Hospital Remote Agent installed. The notification application starts at the UI user sign-in and restarts independently after failure.'
 
 # SIG # Begin signature block
 # MIIHTgYJKoZIhvcNAQcCoIIHPzCCBzsCAQExDzANBglghkgBZQMEAgEFADB5Bgor

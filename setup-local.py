@@ -68,8 +68,9 @@ def inspect():
     absent = [k for k in required if not env.get(k)]
     if absent:
         raise SystemExit('Missing environment settings: ' + ', '.join(absent))
-    if placeholder(cfg.get('collector_key', '')):
-        raise SystemExit('Collector credential is not provisioned. Issue a per-machine credential from the administrator API.')
+    credential_file = cfg.get('collector_credential_file', '')
+    if placeholder(credential_file) or not (CONFIG.parent / credential_file).is_file():
+        raise SystemExit('Protected collector credential is not provisioned. Issue and protect a per-machine credential first.')
     if not cfg.get('machine_code') or not cfg.get('server_url'):
         raise SystemExit('Collector machine_code or server_url is missing.')
     print('Configuration validated without modification.')

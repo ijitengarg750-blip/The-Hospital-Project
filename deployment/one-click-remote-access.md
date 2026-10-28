@@ -2,9 +2,9 @@
 
 ## What is implemented
 
-The dashboard now uses `POST /api/studies/{id}/remote-sessions`, waits for the Windows agent to mark the request ready, exchanges the connection grant for a 30-second one-use viewer ticket, and opens the noVNC 1.7.0 library inside the dashboard. The viewer ticket is carried as a WebSocket subprotocol. It is not a VNC or Windows credential.
+The dashboard uses `POST /api/studies/{id}/remote-sessions`, waits for the Windows agent to prove that local VNC authentication succeeds, exchanges the connection grant for a 30-second one-use viewer ticket, and opens the noVNC 1.7.0 library inside the dashboard. The viewer ticket is carried as a WebSocket subprotocol. It is not a VNC or Windows credential.
 
-The backend gateway performs classic RFB/VNC authentication type 2 itself and then exposes an already-authenticated RFB byte stream to noVNC. The VNC password is read from a Docker secret file. It is not returned by an API, put in a URL, stored in PostgreSQL, or supplied to browser JavaScript.
+After consuming the viewer ticket, the gateway mints a separate 30-second, session-specific tunnel ticket. The Windows agent verifies and consumes that ticket once before it opens and authenticates the loopback VNC connection with the DPAPI-protected local password. A gateway certificate by itself cannot open VNC. Neither the VNC password nor the tunnel ticket is returned by an API, put in a URL, stored in PostgreSQL, or supplied to browser JavaScript.
 
 The gateway currently supports RFB 3.3, 3.7, and 3.8 with classic VNC authentication type 2. That legacy mechanism uses at most eight password bytes, so the gateway rejects longer values rather than silently truncating them. It must run over the hospital VPN/isolated network because classic RFB authentication does not encrypt the desktop stream. Confirm the hospital VNC product can require this mode. If it supports VeNCrypt, RealVNC RSA-AES, or another stronger security type, add that upstream authentication method before production; never fall back to browser-side credentials.
 
@@ -45,7 +45,7 @@ Paste the one-time agent key returned by `POST /api/machines/{id}/agent-credenti
 - gives that UI only a random loopback-control token, never the machine agent key; and
 - listens for UI control only on `127.0.0.1:19377`.
 
-The service reports `locked`, `unlocked`, or `signed_out` using Windows session-change notifications and active-console inspection. After an unexpected service restart while a user is already signed in, it reports `unavailable` until Windows emits the next logon/lock/unlock event, rather than guessing whether the desktop is locked. It automatically accepts an authorized dashboard session without local approval. The per-user UI becomes visible for an active session, displays doctor messages, can reply, and has a local End Session button.
+The service reports `locked`, `unlocked`, or `signed_out` using Windows session-change notifications and active-console inspection. After an unexpected service restart while a user is already signed in, it reports `unavailable` until Windows emits the next logon/lock/unlock event, rather than guessing whether the desktop is locked. A restart clears all in-memory tunnel authorization and ends, rather than silently reauthorizes, an older ready/connected server session. The per-user UI is a separate restartable task; it displays doctor messages and has a local End Session button that revokes the local authorization and closes the actual stream before best-effort server reconciliation.
 
 Production deployment must Authenticode-sign both executables and the WPF script (or replace the script with a signed native UI), configure outbound firewall access only to the dashboard, and run the server endpoint over HTTPS.
 

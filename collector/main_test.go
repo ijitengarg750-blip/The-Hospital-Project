@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,35 @@ import (
 	"testing"
 	"time"
 )
+
+func TestPlaintextCollectorCredentialIsRejectedInJSON(t *testing.T) {
+	var cfg Config
+	for _, field := range []string{"collector_key", "api_key"} {
+		if err := json.Unmarshal([]byte(`{"machine_code":"TEST-1","`+field+`":"must-not-load","collector_credential_file":"credential.dat"}`), &cfg); err == nil {
+			t.Fatalf("plaintext %s was accepted", field)
+		}
+	}
+}
+
+func TestCollectorWritesIndependentHealthWithoutCredential(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "health.json")
+	state := State{Uploaded: map[string]string{"exam.dcm": "digest"}, Failures: map[string]Failure{"queued.dcm": {Attempts: 2}}}
+
+	if err := saveHealth(path, state, "upload failed; see collector log"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var health CollectorHealth
+	if err = json.Unmarshal(raw, &health); err != nil {
+		t.Fatal(err)
+	}
+	if health.Status != "degraded" || health.LastError == "" || health.UploadedFiles != 1 || health.QueuedFailures != 1 || strings.Contains(string(raw), "collector_key") {
+		t.Fatalf("health=%+v raw=%s", health, raw)
+	}
+}
 
 func TestInterruptedUploadRecoversAfterRestartWithoutReuploadingSuccess(t *testing.T) {
 	directory := t.TempDir()

@@ -2,20 +2,32 @@ package agent
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"testing"
 	"time"
 )
+
+func signedTunnelTicket(agentKey, sessionID string, expires time.Time) string {
+	payload := sessionID + "\n" + fmt.Sprint(expires.Unix()) + "\nnonce"
+	key := sha256.Sum256([]byte(agentKey))
+	mac := hmac.New(sha256.New, key[:])
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
 
 func gatewayIdentity(t *testing.T) (tls.Certificate, string) {
 	t.Helper()
@@ -91,8 +103,10 @@ func TestTunnelEncryptsVNCAndRequiresGatewayCertificate(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	config := Config{TunnelCertificate: agentCert, TunnelPrivateKey: agentKey, GatewayCACertificate: gatewayCA, VNCAddress: vncAddress, VNCPassword: "correct"}
-	go func() { _ = ServeTunnel(ctx, listener, config) }()
+	config := Config{AgentKey: "agent-secret", TunnelCertificate: agentCert, TunnelPrivateKey: agentKey, GatewayCACertificate: gatewayCA, VNCAddress: vncAddress, VNCPassword: "correct"}
+	authorizer := NewTunnelAuthorizer(config.AgentKey)
+	authorizer.Arm("session-1")
+	go func() { _ = ServeTunnel(ctx, listener, config, authorizer) }()
 
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM([]byte(agentCert)) {
@@ -106,6 +120,9 @@ func TestTunnelEncryptsVNCAndRequiresGatewayCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
+	if err = writeTunnelAuthorization(connection, "session-1", signedTunnelTicket(config.AgentKey, "session-1", time.Now().Add(30*time.Second))); err != nil {
+		t.Fatal(err)
+	}
 	ready := make([]byte, len(tunnelReady))
 	if _, err = io.ReadFull(connection, ready); err != nil || string(ready) != tunnelReady {
 		t.Fatalf("ready: %q %v", ready, err)
@@ -123,6 +140,47 @@ func TestTunnelEncryptsVNCAndRequiresGatewayCertificate(t *testing.T) {
 	}
 }
 
+func TestTunnelAuthorizationIsSessionSpecificSingleUseAndRevocationClosesTheStream(t *testing.T) {
+	authorizer := NewTunnelAuthorizer("agent-secret")
+	authorizer.Arm("session-1")
+	wrongClient, wrongServer := net.Pipe()
+	defer wrongServer.Close()
+	if authorizer.Authorize(wrongClient, "session-2", signedTunnelTicket("agent-secret", "session-2", time.Now().Add(30*time.Second))) {
+		t.Fatal("wrong session was authorized")
+	}
+	wrongClient.Close()
+
+	client, server := net.Pipe()
+	defer server.Close()
+	ticket := signedTunnelTicket("agent-secret", "session-1", time.Now().Add(30*time.Second))
+	if !authorizer.Authorize(client, "session-1", ticket) {
+		t.Fatal("valid ticket was rejected")
+	}
+	if authorizer.Authorize(wrongClient, "session-1", ticket) {
+		t.Fatal("ticket was accepted twice")
+	}
+	authorizer.Revoke("session-1")
+	_ = server.SetDeadline(time.Now().Add(time.Second))
+	if _, err := server.Write([]byte{1}); err == nil {
+		t.Fatal("revocation did not close the authorized stream")
+	}
+}
+
+func TestTunnelAuthorizationRejectsExpiredAndRestartedSessions(t *testing.T) {
+	authorizer := NewTunnelAuthorizer("agent-secret")
+	authorizer.Arm("session-1")
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	if authorizer.Authorize(client, "session-1", signedTunnelTicket("agent-secret", "session-1", time.Now().Add(-time.Second))) {
+		t.Fatal("expired ticket was authorized")
+	}
+	restarted := NewTunnelAuthorizer("agent-secret")
+	if restarted.Authorize(client, "session-1", signedTunnelTicket("agent-secret", "session-1", time.Now().Add(30*time.Second))) {
+		t.Fatal("connector restart silently reauthorized an old session")
+	}
+}
+
 func TestTunnelRejectsUnencryptedConnections(t *testing.T) {
 	agentCert, agentKey, err := GenerateMachineIdentity("SIRIUS-2")
 	if err != nil {
@@ -136,7 +194,7 @@ func TestTunnelRejectsUnencryptedConnections(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		_ = ServeTunnel(ctx, listener, Config{TunnelCertificate: agentCert, TunnelPrivateKey: agentKey, GatewayCACertificate: gatewayCA})
+		_ = ServeTunnel(ctx, listener, Config{TunnelCertificate: agentCert, TunnelPrivateKey: agentKey, GatewayCACertificate: gatewayCA}, NewTunnelAuthorizer("agent-secret"))
 	}()
 
 	plain, err := net.Dial("tcp", listener.Addr().String())

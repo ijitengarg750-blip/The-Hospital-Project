@@ -7,19 +7,17 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $program = Join-Path $env:ProgramFiles 'HospitalRemoteAgent'
 $data = Join-Path $env:ProgramData 'HospitalRemoteAgent'
-$launcherRecord = Join-Path $data 'ui-launcher-path.txt'
-if (Test-Path -LiteralPath $launcherRecord) {
-  $launcher = [IO.File]::ReadAllText($launcherRecord, [Text.Encoding]::Unicode)
-  if ([IO.Path]::GetFileName($launcher) -ne 'HospitalRemoteUI.lnk' -or (Split-Path -Parent $launcher) -notlike '*\Microsoft\Windows\Start Menu\Programs\Startup') { throw 'Refusing to remove an unexpected UI launcher path.' }
-  if (Test-Path -LiteralPath $launcher) { Remove-Item -LiteralPath $launcher -Force }
-}
+$taskService = New-Object -ComObject 'Schedule.Service'
+$taskService.Connect()
+$taskFolder = $taskService.GetFolder('\')
+try { $taskFolder.DeleteTask('Hospital Remote Notification UI', 0) } catch [System.Runtime.InteropServices.COMException] { if ($_.Exception.HResult -ne -2147024894) { throw } }
 $agent = Join-Path $program 'hospital-remote-agent.exe'
 if (Test-Path -LiteralPath $agent) { & $agent uninstall }
 if (Test-Path -LiteralPath $program) { Remove-Item -LiteralPath $program -Recurse -Force }
 if ($RemoveConfiguration) {
   if (Test-Path -LiteralPath $data) { Remove-Item -LiteralPath $data -Recurse -Force }
 }
-Write-Host 'Hospital Remote Agent and per-user notification launcher removed.'
+Write-Host 'Hospital Remote Agent and per-user notification task removed.'
 
 # SIG # Begin signature block
 # MIIHTgYJKoZIhvcNAQcCoIIHPzCCBzsCAQExDzANBglghkgBZQMEAgEFADB5Bgor

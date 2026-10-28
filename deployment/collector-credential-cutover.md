@@ -7,7 +7,7 @@ This is a controlled maintenance cutover. The backend intentionally has no legac
 3. Stop only the Data Collector on each diagnostic PC. Do not stop the Remote Connector or TightVNC.
 4. Deploy the backend change. Startup adds the `machine_collector_credentials` table without modifying patient, study, Practo UID, report, or remote-session tables.
 5. For each active machine, call `POST /api/machines/{machine_id}/collector-credentials` as an administrator. Store the returned key only in that machine's protected local collector configuration; the response is not recoverable later.
-6. Replace the collector binary/config field `api_key` with the new binary/config field `collector_key`, then start that machine's collector.
+6. Run the signed collector with a new filename, for example `hospital-collector.exe protect-credential collector-credential-2026-10.dat ".\HospitalCollectorSvc"`, paste the new key into the hidden prompt, and set `collector_credential_file` in `config.json`. The command refuses to overwrite an existing blob and applies the required ACL immediately because machine-scope DPAPI alone is decryptable by other local accounts. Plaintext `api_key` and `collector_key` fields are rejected.
 7. Verify one retained or synthetic report uploads over HTTPS, appears under the expected Practo UID, and remains visible to the doctor workflow before moving to the next machine.
 8. Confirm the former shared key receives HTTP 401 for every machine. Keep it revoked.
 

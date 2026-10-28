@@ -17,15 +17,26 @@ Describe 'Install-Agent signature preflight' {
     $installer.Contains('Paste the one-time enrollment token when prompted.') | Should Be $true
   }
 
-  It 'uses a shortcut instead of generating an unsigned command script' {
-    $installer.Contains("'HospitalRemoteUI.lnk'") | Should Be $true
+  It 'uses a restartable per-user task instead of a startup launcher' {
+    $installer.Contains("'Hospital Remote Notification UI'") | Should Be $true
+    $installer.Contains("RestartCount = 5") | Should Be $true
+    $installer.Contains("RestartInterval = 'PT1M'") | Should Be $true
+    $installer.Contains("'HospitalRemoteUI.lnk'") | Should Be $false
     $installer.Contains("'HospitalRemoteUI.cmd'") | Should Be $false
   }
 
-  It 'runs only the signed UI script and starts it for the installing UI user' {
+  It 'runs only the signed UI script under an interactive user token' {
     $installer.Contains('-ExecutionPolicy AllSigned') | Should Be $true
-    $installer.Contains('if ($identity.User.Value -eq $sid)') | Should Be $true
-    $installer.Contains('Start-Process -FilePath $launcher') | Should Be $true
+    $installer.Contains('LogonType = 3') | Should Be $true
+  }
+}
+
+Describe 'Collector credential ACL' {
+  It 'uses an exact protected ACL instead of retaining inherited or explicit grants' {
+    $collectorInstaller = Get-Content -Raw (Join-Path $PSScriptRoot '..\deployment\install-collector-task.ps1')
+    $collectorInstaller.Contains('SetAccessRuleProtection($true, $false)') | Should Be $true
+    $collectorInstaller.Contains('Set-Acl -LiteralPath $CredentialFile') | Should Be $true
+    $collectorInstaller.Contains('icacls $CredentialFile') | Should Be $false
   }
 }
 

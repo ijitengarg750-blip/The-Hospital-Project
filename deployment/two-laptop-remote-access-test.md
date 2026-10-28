@@ -83,7 +83,13 @@ Do not expose 5900 or 5910 to the internet. This repository does not deploy a VP
 
 ## 6. Acceptance sequence
 
-From the admin screen, **Test connection** must report reachable. Then sign in as the granted doctor and open a synthetic study:
+First separate listener startup from network filtering:
+
+1. On Laptop B, `Get-NetTCPConnection -LocalPort 5910 -State Listen` must show the signed agent process. If it does not, this is a bind/startup failure; inspect the `HospitalRemoteAgent` Windows Event Log entries. A firewall rule cannot repair a missing listener.
+2. From Laptop A, run `Test-NetConnection <Laptop-B-private-IP> -Port 5910`. If Laptop B is listening but this remote test fails, investigate the inbound firewall rule, profile, VLAN/VPN route, or address—not the bind.
+3. From the admin screen, **Test connection** must report reachable. This proves TCP reachability plus mutual TLS identity only; it deliberately does not authorize VNC or claim session readiness.
+
+Then sign in as the granted doctor and open a synthetic study:
 
 1. The desktop appears without a browser password prompt.
 2. The local notice identifies the session and messages flow both ways.
@@ -97,7 +103,12 @@ Repeat while Windows is unlocked, locked, signed out, and after reboot. Locked/s
 
 Perform each test independently and restore the file/service afterward:
 
-- stop the agent: connection test is unreachable;
+- stop TightVNC: the session remains requested and never reports Ready; connector heartbeat and report collection continue;
+- stop the remote connector: collector health remains current and queued reports continue; connection test is unreachable;
+- restart the remote connector during an active session: the stream closes and the old session is ended rather than reauthorized;
+- stop the collector: connector heartbeat, local UI, and TightVNC remain available; restart the collector and confirm its durable queue resumes without duplicate upload;
+- terminate the notification UI: connector, active transport, collector, and TightVNC continue; Task Scheduler restarts only the UI;
+- disconnect Laptop B from the dashboard, select local **End Session**, and prove the current stream closes and the same viewer/tunnel tickets cannot reconnect;
 - remove the backend gateway client certificate: connection test is unreachable;
 - change the configured TLS server name: certificate verification fails;
 - attempt plaintext TCP on 5910: no tunnel-ready preface or VNC bytes are returned;
@@ -112,6 +123,7 @@ At no point should the gateway retry TCP 5900 or another unencrypted route.
 docker compose -f docker-compose.yml -f docker-compose.remote-access.yml -f docker-compose.two-laptop.yml logs --tail 200 backend frontend
 sc.exe query HospitalRemoteAgent
 netstat -ano | findstr :5910
+Get-NetTCPConnection -LocalPort 5910 -State Listen
 ```
 
 For foreground agent diagnostics, stop the service and run its `console` command with the DPAPI configuration, then restart the service. Logs must not contain the enrollment token, agent key, private key, VNC password, or patient content.

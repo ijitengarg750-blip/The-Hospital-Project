@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass, field
+from hashlib import sha256
+import hmac
 import json
 from pathlib import Path
 import re
+import secrets
 import socket
 import ssl
 import struct
@@ -13,15 +17,17 @@ from typing import Any
 
 from Crypto.Cipher import DES
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
 
 from .config import get_settings
 from . import database
 from .models import AuditLog, Machine
-from .remote_sessions import RemoteSession, consume_viewer_ticket, utcnow
+from .remote_sessions import MachineAgent, RemoteSession, consume_viewer_ticket, utcnow
 
 router = APIRouter(prefix="/api")
 _VERSION = re.compile(rb"RFB 003\.(\d{3})\n")
-_TUNNEL_READY = b"HOSPITAL-RFB/1\n"
+_TUNNEL_READY = b"HOSPITAL-RFB/2\n"
+_TUNNEL_TICKET_LIFETIME_SECONDS = 30
 
 
 class GatewayConfigurationError(RuntimeError):
@@ -107,7 +113,17 @@ def load_machine_target(config_path: Path, machine_code: str) -> MachineVncTarge
     return MachineVncTarget(host=host, port=port, password=password)
 
 
-def open_secure_transport(machine: Machine, network: Any, settings) -> ssl.SSLSocket:
+def mint_tunnel_ticket(session_id: str, agent_key_hash: str) -> str:
+    expires = int(time.time()) + _TUNNEL_TICKET_LIFETIME_SECONDS
+    payload = f"{session_id}\n{expires}\n{secrets.token_urlsafe(16)}".encode()
+    signature = hmac.new(bytes.fromhex(agent_key_hash), payload, sha256).digest()
+    return ".".join(
+        base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+        for value in (payload, signature)
+    )
+
+
+def _open_secure_channel(machine: Machine, network: Any, settings) -> ssl.SSLSocket:
     if (
         not network
         or not network.agent_certificate_pem
@@ -129,11 +145,8 @@ def open_secure_transport(machine: Machine, network: Any, settings) -> ssl.SSLSo
         connection = context.wrap_socket(raw, server_hostname=network.tls_server_name)
         raw = None  # Ownership moved to the TLS socket.
         connection.settimeout(5)
-        if _read_exact(connection, len(_TUNNEL_READY)) != _TUNNEL_READY:
-            raise GatewayConfigurationError("Agent tunnel did not authorize the VNC connection")
-        connection.settimeout(None)
         return connection
-    except (OSError, ssl.SSLError, ValueError, GatewayConfigurationError) as exc:
+    except (OSError, ssl.SSLError, ValueError, ConnectionError, GatewayConfigurationError) as exc:
         if connection:
             connection.close()
         elif raw:
@@ -141,12 +154,39 @@ def open_secure_transport(machine: Machine, network: Any, settings) -> ssl.SSLSo
         raise GatewayConfigurationError("Mandatory encrypted VNC transport failed") from exc
 
 
+def open_secure_transport(machine: Machine, network: Any, settings, session_id: str, tunnel_ticket: str) -> ssl.SSLSocket:
+    if not session_id or len(session_id) > 128 or not tunnel_ticket or len(tunnel_ticket) > 512:
+        raise GatewayConfigurationError("Tunnel authorization is invalid")
+    connection = _open_secure_channel(machine, network, settings)
+    try:
+        authorization = json.dumps(
+            {"session_id": session_id, "ticket": tunnel_ticket}, separators=(",", ":")
+        ).encode() + b"\n"
+        connection.sendall(authorization)
+        if _read_exact(connection, len(_TUNNEL_READY)) != _TUNNEL_READY:
+            raise GatewayConfigurationError("Agent tunnel did not authorize the VNC connection")
+        connection.settimeout(None)
+        return connection
+    except (OSError, ssl.SSLError, ValueError, GatewayConfigurationError) as exc:
+        connection.close()
+        raise GatewayConfigurationError("Mandatory encrypted VNC transport failed") from exc
+
+
 def probe_secure_transport(machine: Machine, network: Any, settings) -> tuple[str, int | None, str | None]:
     started = time.monotonic()
     try:
-        connection = open_secure_transport(machine, network, settings)
-    except GatewayConfigurationError:
-        return "unreachable", None, "Encrypted agent tunnel could not be established"
+        connection = _open_secure_channel(machine, network, settings)
+    except GatewayConfigurationError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, ConnectionRefusedError):
+            detail = "TCP connection refused: listener unavailable or connection actively rejected; confirm local bind health"
+        elif isinstance(cause, (TimeoutError, socket.timeout)):
+            detail = "TCP connection timed out: firewall filtering or network route/address failure"
+        elif isinstance(cause, ssl.SSLCertVerificationError):
+            detail = "Mutual TLS certificate validation failed"
+        else:
+            detail = "Encrypted agent tunnel could not be established"
+        return "unreachable", None, detail
     connection.close()
     return "reachable", round((time.monotonic() - started) * 1000), None
 
@@ -207,12 +247,17 @@ async def remote_framebuffer(websocket: WebSocket, session_id: str):
         machine = db.get(Machine, session.machine_id)
         from .machine_admin import MachineNetwork
         network = db.get(MachineNetwork, session.machine_id)
+        identity = db.scalar(select(MachineAgent).where(MachineAgent.machine_id == session.machine_id))
+        if not identity:
+            await websocket.close(code=1011)
+            return
+        tunnel_ticket = mint_tunnel_ticket(session.id, identity.key_hash)
         db.add(AuditLog(username=session.doctor_username, action="remote.gateway.connect", resource=f"session:{session.id};machine:{machine_code}"))
         db.commit()
     upstream = None
     end_reason = "gateway_disconnected"
     try:
-        upstream = await asyncio.to_thread(open_secure_transport, machine, network, settings)
+        upstream = await asyncio.to_thread(open_secure_transport, machine, network, settings, session_id, tunnel_ticket)
         await websocket.accept(subprotocol=protocol)
         await _browser_handshake(websocket)
         tasks = {

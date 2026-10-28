@@ -93,17 +93,23 @@ Use x64 for 64-bit Windows and x86 for 32-bit Windows. The resulting executable 
 1. Create `C:\HospitalCollector`.
 2. Copy the correct collector executable to it as `hospital-collector.exe`.
 3. Copy `config.example.json` to `config.json`.
-4. Set `machine_code`, server address, the per-machine collector credential issued by an administrator, and the actual PACS export folder.
-5. Run it manually once in Command Prompt:
+4. Set `machine_code`, server address, `collector_credential_file`, and the actual PACS export folder.
+5. Protect the one-time per-machine credential using the signed collector executable. Input is hidden and the JSON file never contains the key:
+
+   ```cmd
+   hospital-collector.exe protect-credential collector-credential.dat ".\HospitalCollectorSvc"
+   ```
+
+6. Run it manually once in Command Prompt:
 
    ```cmd
    cd C:\HospitalCollector
    hospital-collector.exe config.json
    ```
 
-6. Finish one test examination.
-7. Confirm the log says `uploaded` and the Practo UID appears in the dashboard.
-8. Install it as an automatic startup task using `deployment\install-collector-task.ps1` under a dedicated low-privilege Windows account.
+7. Finish one test examination.
+8. Confirm the log says `upload_accepted`, `health.json` is current, and the Practo UID appears in the dashboard.
+9. Install it as an automatic startup task using `deployment\install-collector-task.ps1` under a dedicated low-privilege Windows account. The task restarts only the collector after failure.
 
 The collector only reads source files. It never deletes or changes PACS exports.
 
@@ -115,7 +121,7 @@ The collector only reads source files. It never deletes or changes PACS exports.
 {
   "machine_code": "SIRIUS-ROOM-2",
   "server_url": "https://dashboard.hospital.example",
-  "collector_key": "credential issued only for SIRIUS-ROOM-2",
+  "collector_credential_file": "collector-credential.dat",
   "watch_folders": ["C:\\PACS_EXPORT"],
   "extensions": [".dcm"],
   "practo_uid_regex": "",
@@ -135,7 +141,7 @@ For a path such as `D:\Exports\10042\2026-10-21\report.pdf`:
 {
   "machine_code": "OCT-ROOM-1",
   "server_url": "https://dashboard.hospital.example",
-  "collector_key": "credential issued only for OCT-ROOM-1",
+  "collector_credential_file": "collector-credential.dat",
   "watch_folders": ["D:\\Exports"],
   "extensions": [".pdf", ".jpg", ".mp4"],
   "practo_uid_regex": "Exports[\\\\/](\\d+)",
