@@ -177,6 +177,19 @@ func (c *Client) End(id string) (Session, error) {
 	return session, err
 }
 
+func prepareRequestedSession(ctx context.Context, client *Client, session Session, readiness func(context.Context) error) (Session, error) {
+	if session.Status != "requested" {
+		return session, nil
+	}
+	if readiness == nil {
+		return session, errors.New("remote-session readiness check is not configured")
+	}
+	if err := readiness(ctx); err != nil {
+		return session, err
+	}
+	return client.MarkReady(session.ID)
+}
+
 type Snapshot struct {
 	MachineState string    `json:"machine_state"`
 	Session      *Session  `json:"session,omitempty"`
@@ -281,7 +294,7 @@ func (s *RuntimeState) Handler(client *Client) http.Handler {
 	return mux
 }
 
-func Run(ctx context.Context, client *Client, state *RuntimeState, machineState func() string) error {
+func Run(ctx context.Context, client *Client, state *RuntimeState, machineState func() string, readiness func(context.Context) error) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	var active *Session
@@ -307,11 +320,9 @@ func Run(ctx context.Context, client *Client, state *RuntimeState, machineState 
 		if err != nil {
 			continue
 		}
-		if session.Status == "requested" {
-			session, err = client.MarkReady(session.ID)
-			if err != nil {
-				continue
-			}
+		session, err = prepareRequestedSession(ctx, client, session, readiness)
+		if err != nil {
+			continue
 		}
 		active = &session
 		state.SetSession(active)

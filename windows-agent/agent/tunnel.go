@@ -149,6 +149,25 @@ func authenticateLocalVNC(connection net.Conn, password string) error {
 	return nil
 }
 
+func CheckLocalVNC(ctx context.Context, address, password string) error {
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	connection, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return fmt.Errorf("connect to local VNC: %w", err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	if err = authenticateLocalVNC(connection, password); err != nil {
+		return fmt.Errorf("authenticate local VNC: %w", err)
+	}
+	return nil
+}
+
+func ValidateTunnelConfig(config Config) error {
+	_, err := tunnelTLSConfig(config)
+	return err
+}
+
 func serveTunnelConnection(client net.Conn, config Config) {
 	defer client.Close()
 	if tlsClient, ok := client.(*tls.Conn); ok {

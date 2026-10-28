@@ -1,11 +1,46 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+func TestRequestedSessionIsNotMarkedReadyWhenVNCIsUnavailable(t *testing.T) {
+	readyCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agent/remote-sessions/session-1/ready" {
+			readyCalls++
+		}
+	}))
+	defer server.Close()
+	client := NewClient(Config{ServerURL: server.URL, MachineCode: "SIRIUS-1", AgentKey: "agent-secret"})
+
+	_, err := prepareRequestedSession(context.Background(), client, Session{ID: "session-1", Status: "requested"}, func(context.Context) error {
+		return errors.New("VNC unavailable")
+	})
+
+	if err == nil || readyCalls != 0 {
+		t.Fatalf("err=%v readyCalls=%d", err, readyCalls)
+	}
+}
+
+func TestRequestedSessionIsMarkedReadyAfterVNCCheck(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(Session{ID: "session-1", Status: "ready"})
+	}))
+	defer server.Close()
+	client := NewClient(Config{ServerURL: server.URL, MachineCode: "SIRIUS-1", AgentKey: "agent-secret"})
+
+	session, err := prepareRequestedSession(context.Background(), client, Session{ID: "session-1", Status: "requested"}, func(context.Context) error { return nil })
+
+	if err != nil || session.Status != "ready" {
+		t.Fatalf("session=%+v err=%v", session, err)
+	}
+}
 
 func TestClientHeartbeatClaimsSessionMessagesAndEnds(t *testing.T) {
 	var ended bool

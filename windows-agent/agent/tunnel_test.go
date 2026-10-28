@@ -181,3 +181,13 @@ func TestLocalVNCAuthenticationSupportsLegacyRFB33(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCheckLocalVNCRequiresAUsableAuthenticatedServer(t *testing.T) {
+	address, _ := fakeVNC(t)
+	if err := CheckLocalVNC(context.Background(), address, "correct"); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLocalVNC(context.Background(), "127.0.0.1:1", "correct"); err == nil {
+		t.Fatal("unreachable VNC server reported ready")
+	}
+}

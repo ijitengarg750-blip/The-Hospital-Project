@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 	"hospital/remote-agent/agent"
 )
@@ -28,8 +29,13 @@ type serviceHandler struct{ configPath string }
 
 func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, statuses chan<- svc.Status) (bool, uint32) {
 	statuses <- svc.Status{State: svc.StartPending}
+	logger, _ := eventlog.Open(serviceName)
+	if logger != nil {
+		defer logger.Close()
+	}
 	config, err := agent.LoadConfig(handler.configPath)
 	if err != nil {
+		logServiceError(logger, "load protected configuration", err)
 		return true, 1
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -37,45 +43,106 @@ func (handler *serviceHandler) Execute(_ []string, requests <-chan svc.ChangeReq
 	windowsState := agent.NewWindowsState()
 	client := agent.NewClient(config)
 	runtimeState := agent.NewRuntimeState(config.UIToken)
-	go runLocalControl(ctx, runtimeState.Handler(client))
-	go agent.Run(ctx, client, runtimeState, windowsState.Get)
-	if config.TunnelListen != "" {
-		go agent.RunTunnel(ctx, config)
+	localFailures, err := startLocalControl(ctx, runtimeState.Handler(client))
+	if err != nil {
+		logServiceError(logger, "start local control", err)
+		return true, 1
 	}
-	statuses <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange}
-	for request := range requests {
-		switch request.Cmd {
-		case svc.Stop, svc.Shutdown:
-			statuses <- svc.Status{State: svc.StopPending}
-			cancel()
-			return false, 0
-		case svc.SessionChange:
-			switch request.EventType {
-			case windows.WTS_SESSION_LOCK:
-				windowsState.Set("locked")
-			case windows.WTS_SESSION_UNLOCK, windows.WTS_SESSION_LOGON:
-				windowsState.Set("unlocked")
-			case windows.WTS_SESSION_LOGOFF:
-				windowsState.Set("signed_out")
-			}
+	var tunnelFailures <-chan error
+	if config.TunnelListen != "" {
+		tunnelFailures, err = startTunnel(ctx, config)
+		if err != nil {
+			logServiceError(logger, "start secure tunnel", err)
+			return true, 1
 		}
 	}
-	return false, 0
+	agentFailures := make(chan error, 1)
+	go func() { agentFailures <- agent.Run(ctx, client, runtimeState, windowsState.Get, vncReadiness(config)) }()
+	statuses <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange}
+	for {
+		select {
+		case request, ok := <-requests:
+			if !ok {
+				cancel()
+				return false, 0
+			}
+			switch request.Cmd {
+			case svc.Stop, svc.Shutdown:
+				statuses <- svc.Status{State: svc.StopPending}
+				cancel()
+				return false, 0
+			case svc.SessionChange:
+				switch request.EventType {
+				case windows.WTS_SESSION_LOCK:
+					windowsState.Set("locked")
+				case windows.WTS_SESSION_UNLOCK, windows.WTS_SESSION_LOGON:
+					windowsState.Set("unlocked")
+				case windows.WTS_SESSION_LOGOFF:
+					windowsState.Set("signed_out")
+				}
+			}
+		case err = <-localFailures:
+			logServiceError(logger, "local control stopped", err)
+			statuses <- svc.Status{State: svc.StopPending}
+			return true, 1
+		case err = <-tunnelFailures:
+			logServiceError(logger, "secure tunnel stopped", err)
+			statuses <- svc.Status{State: svc.StopPending}
+			return true, 1
+		case err = <-agentFailures:
+			logServiceError(logger, "agent loop stopped", err)
+			statuses <- svc.Status{State: svc.StopPending}
+			return true, 1
+		}
+	}
 }
 
-func runLocalControl(ctx context.Context, handler http.Handler) {
-	listener, err := net.Listen("tcp", "127.0.0.1:19377")
-	if err != nil {
+func logServiceError(logger *eventlog.Log, component string, err error) {
+	if logger == nil {
 		return
 	}
+	if err == nil {
+		err = errors.New("stopped unexpectedly")
+	}
+	_ = logger.Error(1, component+": "+err.Error())
+}
+
+func startLocalControl(ctx context.Context, handler http.Handler) (<-chan error, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:19377")
+	if err != nil {
+		return nil, err
+	}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 3 * time.Second}
+	failures := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
-	_ = server.Serve(listener)
+	go func() { failures <- server.Serve(listener) }()
+	return failures, nil
+}
+
+func startTunnel(ctx context.Context, config agent.Config) (<-chan error, error) {
+	if err := agent.ValidateTunnelConfig(config); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", config.TunnelListen)
+	if err != nil {
+		return nil, err
+	}
+	failures := make(chan error, 1)
+	go func() { failures <- agent.ServeTunnel(ctx, listener, config) }()
+	return failures, nil
+}
+
+func vncReadiness(config agent.Config) func(context.Context) error {
+	return func(ctx context.Context) error {
+		check, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return agent.CheckLocalVNC(check, config.VNCAddress, config.VNCPassword)
+	}
 }
 
 func randomToken() string {
@@ -184,6 +251,10 @@ func install(args []string) error {
 		return err
 	}
 	defer service.Close()
+	if err = eventlog.InstallAsEventCreate(serviceName, eventlog.Error|eventlog.Warning|eventlog.Info); err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		_ = service.Delete()
+		return fmt.Errorf("register Windows Event Log source: %w", err)
+	}
 	return service.Start()
 }
 
@@ -199,7 +270,11 @@ func uninstall() error {
 	}
 	defer service.Close()
 	_, _ = service.Control(svc.Stop)
-	return service.Delete()
+	if err = service.Delete(); err != nil {
+		return err
+	}
+	_ = eventlog.Remove(serviceName)
+	return nil
 }
 
 func runConsole(configPath string) error {
@@ -210,11 +285,28 @@ func runConsole(configPath string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	state := agent.NewRuntimeState(config.UIToken)
-	go runLocalControl(ctx, state.Handler(agent.NewClient(config)))
-	if config.TunnelListen != "" {
-		go agent.RunTunnel(ctx, config)
+	client := agent.NewClient(config)
+	localFailures, err := startLocalControl(ctx, state.Handler(client))
+	if err != nil {
+		return err
 	}
-	return agent.Run(ctx, agent.NewClient(config), state, agent.NewWindowsState().Get)
+	var tunnelFailures <-chan error
+	if config.TunnelListen != "" {
+		tunnelFailures, err = startTunnel(ctx, config)
+		if err != nil {
+			return err
+		}
+	}
+	agentFailures := make(chan error, 1)
+	go func() {
+		agentFailures <- agent.Run(ctx, client, state, agent.NewWindowsState().Get, vncReadiness(config))
+	}()
+	select {
+	case err = <-localFailures:
+	case err = <-tunnelFailures:
+	case err = <-agentFailures:
+	}
+	return err
 }
 
 func main() {
