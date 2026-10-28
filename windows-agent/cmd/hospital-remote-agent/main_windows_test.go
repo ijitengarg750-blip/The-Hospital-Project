@@ -28,3 +28,12 @@ func TestComponentSupervisorRecoversAfterOnlyThatComponentStops(t *testing.T) {
 		t.Fatalf("degraded=%+v recovered=%+v restarts=%d", degraded, recovered, restarts)
 	}
 }
+
+func TestPreflightCommandHasNoInstallationSideEffects(t *testing.T) {
+	if err := run([]string{"preflight"}); err != nil {
+		t.Fatalf("preflight command failed: %v", err)
+	}
+	if err := run([]string{"preflight", "unexpected"}); err == nil {
+		t.Fatal("preflight accepted an unexpected argument")
+	}
+}

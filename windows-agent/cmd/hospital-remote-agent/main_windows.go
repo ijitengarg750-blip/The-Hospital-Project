@@ -475,32 +475,44 @@ func runConsole(configPath string) error {
 	return err
 }
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: hospital-remote-agent install|uninstall|service|console")
-		os.Exit(2)
+func run(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: hospital-remote-agent install|uninstall|service|console|preflight")
 	}
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "install":
-		err = install(os.Args[2:])
+		err = install(args[1:])
 	case "uninstall":
 		err = uninstall()
 	case "service":
-		if len(os.Args) != 3 {
+		if len(args) != 2 {
 			err = errors.New("service config path is required")
 		} else {
-			err = svc.Run(serviceName, &serviceHandler{configPath: os.Args[2]})
+			err = svc.Run(serviceName, &serviceHandler{configPath: args[1]})
 		}
 	case "console":
-		if len(os.Args) != 3 {
+		if len(args) != 2 {
 			err = errors.New("config path is required")
 		} else {
-			err = runConsole(os.Args[2])
+			err = runConsole(args[1])
+		}
+	case "preflight":
+		if len(args) != 1 {
+			err = errors.New("preflight does not accept arguments")
 		}
 	default:
 		err = errors.New("unknown command")
 	}
+	return err
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: hospital-remote-agent install|uninstall|service|console|preflight")
+		os.Exit(2)
+	}
+	err := run(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

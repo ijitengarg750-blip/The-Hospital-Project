@@ -25,6 +25,10 @@ function Assert-ValidPilotSignature {
 }
 
 $source = Split-Path -Parent $MyInvocation.MyCommand.Path
+$preflight = Join-Path $source 'Preflight.ps1'
+$powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
+& $powerShell -NoProfile -ExecutionPolicy AllSigned -File $preflight -Server $Server
+if ($LASTEXITCODE -ne 0) { throw 'Windows installation preflight failed.' }
 $destination = Join-Path $env:ProgramFiles 'HospitalRemoteAgent'
 $osVersion = [Version](Get-WmiObject Win32_OperatingSystem).Version
 $isLegacyOS = $osVersion.Major -lt 10
@@ -50,7 +54,6 @@ Write-Host 'The agent will show a verification code. Approve the matching code o
 & (Join-Path $destination 'hospital-remote-agent.exe') install --server $Server --machine $MachineCode --ui-user $UIUser
 if ($LASTEXITCODE -ne 0) { throw 'Agent service installation failed.' }
 
-$powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
 $taskService = New-Object -ComObject 'Schedule.Service'
 $taskService.Connect()
 $taskFolder = $taskService.GetFolder('\')

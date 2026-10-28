@@ -54,6 +54,7 @@ New-Item -ItemType Directory -Path $OutputDirectory, $buildDirectory, $uiDirecto
 Copy-Item -LiteralPath $agentOutput -Destination (Join-Path $buildDirectory 'hospital-remote-agent.exe') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Install-Agent.ps1') -Destination (Join-Path $OutputDirectory 'Install-Agent.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Uninstall-Agent.ps1') -Destination (Join-Path $OutputDirectory 'Uninstall-Agent.ps1') -Force
+Copy-Item -LiteralPath (Join-Path $source 'Preflight.ps1') -Destination (Join-Path $OutputDirectory 'Preflight.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $source 'ui\HospitalRemoteUI.ps1') -Destination (Join-Path $uiDirectory 'HospitalRemoteUI.ps1') -Force
 Copy-Item -LiteralPath $publicCertificatePath -Destination (Join-Path $OutputDirectory 'HospitalDashboardPilot.cer') -Force
 Copy-Item -LiteralPath (Join-Path $source 'PILOT-TEST.md') -Destination (Join-Path $OutputDirectory 'README.md') -Force
@@ -65,6 +66,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Executable signing failed.' }
 $scripts = @(
   (Join-Path $OutputDirectory 'Install-Agent.ps1'),
   (Join-Path $OutputDirectory 'Uninstall-Agent.ps1'),
+  (Join-Path $OutputDirectory 'Preflight.ps1'),
   (Join-Path $uiDirectory 'HospitalRemoteUI.ps1')
 )
 foreach ($script in $scripts) {

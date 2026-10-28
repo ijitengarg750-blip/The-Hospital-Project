@@ -8,6 +8,15 @@ Describe 'Install-Agent signature preflight' {
     ($signatureCheck -ge 0 -and $signatureCheck -lt $firstCopy) | Should Be $true
   }
 
+  It 'stops on failed preflight before copying or enrolling' {
+    $preflightCheck = $installer.IndexOf('& $powerShell -NoProfile -ExecutionPolicy AllSigned -File $preflight')
+    $preflightFailure = $installer.IndexOf("throw 'Windows installation preflight failed.'")
+    $firstCopy = $installer.IndexOf('Copy-Item $agentBinary')
+    $enrollment = $installer.IndexOf(' install --server $Server')
+    ($preflightCheck -ge 0 -and $preflightCheck -lt $firstCopy -and $preflightCheck -lt $enrollment) | Should Be $true
+    ($preflightFailure -gt $preflightCheck -and $preflightFailure -lt $firstCopy) | Should Be $true
+  }
+
   It 'requires the agent and UI to have the same valid signer' {
     $installer.Contains('Assert-ValidPilotSignature -Path $agentBinary -ExpectedThumbprint $expectedThumbprint') | Should Be $true
     $installer.Contains('Assert-ValidPilotSignature -Path $uiScript -ExpectedThumbprint $expectedThumbprint') | Should Be $true
@@ -47,5 +56,11 @@ Describe 'New-PilotPackage defaults' {
     $parameterEnd = $packageScript.IndexOf("`n)`n")
     $defaultCalculation = $packageScript.IndexOf("if ([string]::IsNullOrWhiteSpace(`$OutputDirectory))")
     ($defaultCalculation -gt $parameterEnd) | Should Be $true
+  }
+
+  It 'packages and signs the reusable preflight component' {
+    $packageScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'New-PilotPackage.ps1')
+    $packageScript.Contains("'Preflight.ps1'") | Should Be $true
+    $packageScript.Contains("(Join-Path `$OutputDirectory 'Preflight.ps1')") | Should Be $true
   }
 }
