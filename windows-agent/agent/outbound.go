@@ -18,11 +18,12 @@ import (
 )
 
 type outboundMessage struct {
-	Type       string `json:"type"`
-	State      string `json:"state,omitempty"`
-	SessionID  string `json:"session_id,omitempty"`
-	DataTicket string `json:"data_ticket,omitempty"`
-	Detail     string `json:"detail,omitempty"`
+	Type       string                     `json:"type"`
+	State      string                     `json:"state,omitempty"`
+	Components map[string]ComponentHealth `json:"components,omitempty"`
+	SessionID  string                     `json:"session_id,omitempty"`
+	DataTicket string                     `json:"data_ticket,omitempty"`
+	Detail     string                     `json:"detail,omitempty"`
 }
 
 type outboundWriter struct {
@@ -185,7 +186,7 @@ func runOutboundOnce(ctx context.Context, config Config, client *Client, state *
 	sendHeartbeat := func() error {
 		current := machineState()
 		state.SetMachineState(current)
-		return writer.write(ctx, outboundMessage{Type: "heartbeat", State: current})
+		return writer.write(ctx, outboundMessage{Type: "heartbeat", State: current, Components: reportedComponents(state.Snapshot())})
 	}
 	if err = sendHeartbeat(); err != nil {
 		return err

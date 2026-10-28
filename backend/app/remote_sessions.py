@@ -35,6 +35,16 @@ class MachineAgent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AgentComponentHealth(Base):
+    __tablename__ = "agent_component_health"
+    __table_args__ = (UniqueConstraint("machine_id", "name"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    machine_id: Mapped[int] = mapped_column(ForeignKey("machines.id"), index=True)
+    name: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(20))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class RemoteSession(Base):
     __tablename__ = "remote_sessions"
     __table_args__ = (UniqueConstraint("machine_id", "active_slot", name="uq_remote_session_active_machine"),)
@@ -63,14 +73,35 @@ class RemoteMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AgentComponentStatus(BaseModel):
+    status: Literal["healthy", "degraded", "unknown"]
+
+
 class AgentHeartbeat(BaseModel):
     state: MachineState
+    components: dict[str, AgentComponentStatus] = Field(default_factory=dict)
 
 
 class AgentStatusOut(BaseModel):
     machine_code: str
     state: MachineState
     last_seen_at: datetime
+
+
+def record_agent_components(db: Session, machine_id: int, components: dict) -> None:
+    for name, component in components.items():
+        status = component.status if isinstance(component, AgentComponentStatus) else component.get("status") if isinstance(component, dict) else None
+        if name not in {"tightvnc", "notification_ui"} or status not in {"healthy", "degraded", "unknown"}:
+            continue
+        health = db.scalar(select(AgentComponentHealth).where(
+            AgentComponentHealth.machine_id == machine_id,
+            AgentComponentHealth.name == name,
+        ))
+        if health:
+            health.status = status
+            health.updated_at = utcnow()
+        else:
+            db.add(AgentComponentHealth(machine_id=machine_id, name=name, status=status))
 
 
 class SessionOut(BaseModel):
@@ -266,6 +297,7 @@ def agent_heartbeat(
 ):
     agent.state = payload.state
     agent.last_seen_at = utcnow()
+    record_agent_components(db, agent.machine_id, payload.components)
     machine = db.get(Machine, agent.machine_id)
     db.commit()
     return {"machine_code": machine.code, "state": agent.state, "last_seen_at": agent.last_seen_at}

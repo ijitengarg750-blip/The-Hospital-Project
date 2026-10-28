@@ -43,7 +43,7 @@ func TestOutboundConnectorOpensSeparateAuthorizedDataStream(t *testing.T) {
 		defer connection.Close(websocket.StatusNormalClosure, "done")
 		if r.URL.Path == "/api/agent/control" {
 			var heartbeat outboundMessage
-			if wsjson.Read(r.Context(), connection, &heartbeat) != nil || heartbeat.Type != "heartbeat" {
+			if wsjson.Read(r.Context(), connection, &heartbeat) != nil || heartbeat.Type != "heartbeat" || heartbeat.Components["notification_ui"].Status != "unknown" {
 				return
 			}
 			_ = wsjson.Write(r.Context(), connection, outboundMessage{Type: "session_request", SessionID: "session-1", DataTicket: "one-time-ticket"})

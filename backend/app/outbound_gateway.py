@@ -147,8 +147,8 @@ def _authenticate(machine_code: str, agent_key: str):
         return agent.machine_id
 
 
-def _record_heartbeat(machine_id: int, state: str) -> bool:
-    from .remote_sessions import MachineAgent
+def _record_heartbeat(machine_id: int, state: str, components: dict | None = None) -> bool:
+    from .remote_sessions import MachineAgent, record_agent_components
 
     if state not in {"unlocked", "locked", "signed_out", "booting", "busy", "unavailable"}:
         return False
@@ -158,6 +158,8 @@ def _record_heartbeat(machine_id: int, state: str) -> bool:
             return False
         agent.state = state
         agent.last_seen_at = utcnow()
+        if isinstance(components, dict):
+            record_agent_components(db, machine_id, components)
         db.commit()
     return True
 
@@ -213,7 +215,7 @@ async def agent_control(websocket: WebSocket):
             if not isinstance(message, dict):
                 await websocket.close(code=1008, reason="invalid control message")
                 return
-            if message.get("type") == "heartbeat" and _record_heartbeat(machine_id, message.get("state")):
+            if message.get("type") == "heartbeat" and _record_heartbeat(machine_id, message.get("state"), message.get("components")):
                 outbound_hub.dispatch(machine_id, {"type": "heartbeat_ack"})
             elif message.get("type") in {"session_ready", "session_failed"} and _update_session(
                 machine_id,

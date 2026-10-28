@@ -2,13 +2,63 @@ package agent
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestEnrollmentApprovalKeepsCredentialEncryptedToInstaller(t *testing.T) {
+	var publicKey *rsa.PublicKey
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/agent/enrollment-claims":
+			var input struct {
+				PublicKey string `json:"public_key_pem"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&input)
+			block, _ := pem.Decode([]byte(input.PublicKey))
+			parsed, _ := x509.ParsePKIXPublicKey(block.Bytes)
+			publicKey = parsed.(*rsa.PublicKey)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"claim_id": "claim-1", "verification_code": "123456", "expires_at": time.Now().Add(time.Minute)})
+		case "/api/agent/enrollment-claims/claim-1/complete":
+			contentKey := make([]byte, 32)
+			_, _ = rand.Read(contentKey)
+			block, _ := aes.NewCipher(contentKey)
+			gcm, _ := cipher.NewGCM(block)
+			nonce := make([]byte, gcm.NonceSize())
+			_, _ = rand.Read(nonce)
+			sealed := gcm.Seal(nil, nonce, []byte(`{"machine_code":"SIRIUS-1","agent_key":"abcdefghijklmnopqrstuvwxyz1234567890ABCD"}`), nil)
+			tagStart := len(sealed) - gcm.Overhead()
+			encryptedKey, _ := rsa.EncryptOAEP(sha256.New(), rand.Reader, publicKey, contentKey, nil)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"encrypted_enrollment": map[string]string{
+				"key": base64.StdEncoding.EncodeToString(encryptedKey), "nonce": base64.StdEncoding.EncodeToString(nonce),
+				"tag": base64.StdEncoding.EncodeToString(sealed[tagStart:]), "ciphertext": base64.StdEncoding.EncodeToString(sealed[:tagStart]),
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	code := ""
+	result, err := EnrollWithApproval(server.URL, "SIRIUS-1", "", func(value string) { code = value })
+	if err != nil || code != "123456" || result.AgentKey != "abcdefghijklmnopqrstuvwxyz1234567890ABCD" {
+		t.Fatalf("code=%q result=%+v err=%v", code, result, err)
+	}
+}
 
 func TestRequestedSessionIsNotMarkedReadyWhenVNCIsUnavailable(t *testing.T) {
 	readyCalls := 0

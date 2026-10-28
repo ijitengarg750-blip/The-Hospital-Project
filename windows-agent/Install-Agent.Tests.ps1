@@ -13,8 +13,9 @@ Describe 'Install-Agent signature preflight' {
     $installer.Contains('Assert-ValidPilotSignature -Path $uiScript -ExpectedThumbprint $expectedThumbprint') | Should Be $true
   }
 
-  It 'calls the enrollment secret a token' {
-    $installer.Contains('Paste the one-time enrollment token when prompted.') | Should Be $true
+  It 'uses verification-code approval without passing an enrollment secret through the browser' {
+    $installer.Contains('The agent will show a verification code.') | Should Be $true
+    $installer.Contains('one-time enrollment token') | Should Be $false
   }
 
   It 'uses a restartable per-user task instead of a startup launcher' {

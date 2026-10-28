@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import base64
+import json
 import socket
 import struct
 import threading
@@ -9,6 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 import pytest
+from Crypto.Cipher import AES, PKCS1_OAEP
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
@@ -83,13 +88,17 @@ def create_study() -> tuple[int, int]:
 
 
 def provision_agent(client: TestClient, machine_id: int, machine_code: str = "SIRIUS-1") -> tuple[str, dict[str, str]]:
-    issued = client.post(f"/api/machines/{machine_id}/enrollments", headers=admin_headers(client))
-    response = client.post("/api/agent/enroll", json={
-        "machine_code": machine_code,
-        "enrollment_token": issued.json()["enrollment_token"],
-    })
+    assert client.post(f"/api/machines/{machine_id}/enrollments", headers=admin_headers(client)).status_code == 201
+    private_key = RSA.generate(2048)
+    claim = client.post("/api/agent/enrollment-claims", json={"machine_code": machine_code, "public_key_pem": private_key.public_key().export_key().decode()}).json()
+    assert client.post(f"/api/machines/{machine_id}/enrollment-claims/approve", headers=admin_headers(client), json={"verification_code": claim["verification_code"]}).status_code == 204
+    response = client.post(f"/api/agent/enrollment-claims/{claim['claim_id']}/complete", json={})
     assert response.status_code == 201
-    key = response.json()["agent_key"]
+    encrypted = response.json()["encrypted_enrollment"]
+    content_key = PKCS1_OAEP.new(private_key, hashAlgo=SHA256).decrypt(base64.b64decode(encrypted["key"]))
+    cipher = AES.new(content_key, AES.MODE_GCM, nonce=base64.b64decode(encrypted["nonce"]))
+    decrypted = cipher.decrypt_and_verify(base64.b64decode(encrypted["ciphertext"]), base64.b64decode(encrypted["tag"]))
+    key = json.loads(decrypted)["agent_key"]
     return key, {"X-Machine-Code": machine_code, "X-Agent-Key": key}
 
 

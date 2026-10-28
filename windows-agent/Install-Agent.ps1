@@ -46,7 +46,7 @@ New-Item -ItemType Directory -Path $destination -Force | Out-Null
 Copy-Item $agentBinary (Join-Path $destination 'hospital-remote-agent.exe') -Force
 Copy-Item $uiScript $destination -Force
 
-Write-Host 'Paste the one-time enrollment token when prompted. Input is hidden.'
+Write-Host 'The agent will show a verification code. Approve the matching code on the Diagnostic Machines page.'
 & (Join-Path $destination 'hospital-remote-agent.exe') install --server $Server --machine $MachineCode --ui-user $UIUser
 if ($LASTEXITCODE -ne 0) { throw 'Agent service installation failed.' }
 

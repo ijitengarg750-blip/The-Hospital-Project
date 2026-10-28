@@ -3,9 +3,17 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -97,6 +105,104 @@ func Enroll(serverURL, machineCode, enrollmentToken, certificatePEM string) (Enr
 	return result, nil
 }
 
+type enrollmentClaim struct {
+	ID               string    `json:"claim_id"`
+	VerificationCode string    `json:"verification_code"`
+	ExpiresAt        time.Time `json:"expires_at"`
+}
+
+func EnrollWithApproval(serverURL, machineCode, certificatePEM string, showCode func(string)) (EnrollmentResult, error) {
+	var result EnrollmentResult
+	base, err := url.Parse(strings.TrimRight(serverURL, "/"))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return result, errors.New("invalid server URL")
+	}
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return result, err
+	}
+	publicDER, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return result, err
+	}
+	input := map[string]string{"machine_code": machineCode, "public_key_pem": string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER}))}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}}
+	requestJSON := func(path string, input any, output any) (int, error) {
+		body, marshalErr := json.Marshal(input)
+		if marshalErr != nil {
+			return 0, marshalErr
+		}
+		reference, _ := url.Parse(path)
+		request, requestErr := http.NewRequest(http.MethodPost, base.ResolveReference(reference).String(), bytes.NewReader(body))
+		if requestErr != nil {
+			return 0, requestErr
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, requestErr := client.Do(request)
+		if requestErr != nil {
+			return 0, requestErr
+		}
+		defer response.Body.Close()
+		if response.StatusCode >= 200 && response.StatusCode < 300 && output != nil {
+			requestErr = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(output)
+		}
+		return response.StatusCode, requestErr
+	}
+	var claim enrollmentClaim
+	status, err := requestJSON("/api/agent/enrollment-claims", input, &claim)
+	if err != nil || status != http.StatusCreated {
+		if err != nil {
+			return result, fmt.Errorf("begin enrollment failed with HTTP %d: %w", status, err)
+		}
+		return result, fmt.Errorf("begin enrollment failed with HTTP %d", status)
+	}
+	if showCode != nil {
+		showCode(claim.VerificationCode)
+	}
+	for time.Now().Before(claim.ExpiresAt) {
+		var completed struct {
+			Encrypted struct {
+				Key        string `json:"key"`
+				Nonce      string `json:"nonce"`
+				Tag        string `json:"tag"`
+				Ciphertext string `json:"ciphertext"`
+			} `json:"encrypted_enrollment"`
+		}
+		status, err = requestJSON("/api/agent/enrollment-claims/"+url.PathEscape(claim.ID)+"/complete", map[string]string{"agent_certificate_pem": certificatePEM}, &completed)
+		if err == nil && status == http.StatusCreated {
+			encryptedKey, decodeErr := base64.StdEncoding.DecodeString(completed.Encrypted.Key)
+			contentKey, decryptErr := rsa.DecryptOAEP(sha256.New(), rand.Reader, privateKey, encryptedKey, nil)
+			nonce, nonceErr := base64.StdEncoding.DecodeString(completed.Encrypted.Nonce)
+			tag, tagErr := base64.StdEncoding.DecodeString(completed.Encrypted.Tag)
+			ciphertext, ciphertextErr := base64.StdEncoding.DecodeString(completed.Encrypted.Ciphertext)
+			block, blockErr := aes.NewCipher(contentKey)
+			if decodeErr != nil || decryptErr != nil || nonceErr != nil || tagErr != nil || ciphertextErr != nil || blockErr != nil {
+				return result, errors.New("enrollment response could not be decrypted")
+			}
+			gcm, gcmErr := cipher.NewGCM(block)
+			if gcmErr != nil {
+				return result, errors.New("enrollment response could not be decrypted")
+			}
+			plaintext, decryptErr := gcm.Open(nil, nonce, append(ciphertext, tag...), nil)
+			if decryptErr != nil {
+				return result, errors.New("enrollment response could not be decrypted")
+			}
+			if json.Unmarshal(plaintext, &result) != nil || len(result.AgentKey) < 32 {
+				return result, errors.New("enrollment response is incomplete")
+			}
+			return result, nil
+		}
+		if status != http.StatusConflict {
+			if err != nil {
+				return result, fmt.Errorf("complete enrollment failed with HTTP %d: %w", status, err)
+			}
+			return result, fmt.Errorf("complete enrollment failed with HTTP %d", status)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return result, errors.New("enrollment invitation expired before approval")
+}
+
 func NewClient(config Config) *Client {
 	base, _ := url.Parse(strings.TrimRight(config.ServerURL, "/"))
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
@@ -145,8 +251,12 @@ func (c *Client) request(method, path string, input, output any) error {
 	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(output)
 }
 
-func (c *Client) Heartbeat(state string) error {
-	return c.request(http.MethodPost, "/api/agent/heartbeat", map[string]string{"state": state}, nil)
+func (c *Client) Heartbeat(state string, components ...map[string]ComponentHealth) error {
+	input := map[string]any{"state": state}
+	if len(components) > 0 {
+		input["components"] = components[0]
+	}
+	return c.request(http.MethodPost, "/api/agent/heartbeat", input, nil)
 }
 
 func (c *Client) NextSession() (Session, error) {
@@ -211,6 +321,16 @@ type ComponentHealth struct {
 	Status    string    `json:"status"`
 	Error     string    `json:"error,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func reportedComponents(snapshot Snapshot) map[string]ComponentHealth {
+	reported := make(map[string]ComponentHealth, 2)
+	for _, name := range []string{"tightvnc", "notification_ui"} {
+		if health, ok := snapshot.Components[name]; ok {
+			reported[name] = ComponentHealth{Status: health.Status, UpdatedAt: health.UpdatedAt}
+		}
+	}
+	return reported
 }
 
 type RuntimeState struct {
@@ -463,7 +583,7 @@ func Run(ctx context.Context, client *Client, state *RuntimeState, machineState 
 				state.clearPendingEnd(pending)
 			}
 		}
-		if err := client.Heartbeat(current); err != nil {
+		if err := client.Heartbeat(current, reportedComponents(state.Snapshot())); err != nil {
 			state.SetComponent("dashboard_connection", "degraded", err.Error())
 			continue
 		}

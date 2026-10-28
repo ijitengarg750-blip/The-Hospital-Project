@@ -328,24 +328,12 @@ func install(args []string) error {
 	if !strings.HasPrefix(*server, "https://") && !strings.HasPrefix(*server, "http://localhost") && !strings.HasPrefix(*server, "http://127.0.0.1") {
 		return errors.New("server must use HTTPS")
 	}
-	fmt.Fprint(os.Stderr, "One-time enrollment token: ")
 	stdin := windows.Handle(os.Stdin.Fd())
 	var consoleMode uint32
 	consoleInput := windows.GetConsoleMode(stdin, &consoleMode) == nil
 	if consoleInput {
 		_ = windows.SetConsoleMode(stdin, consoleMode&^windows.ENABLE_ECHO_INPUT)
 		defer windows.SetConsoleMode(stdin, consoleMode)
-	}
-	token, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if consoleInput {
-		fmt.Fprintln(os.Stderr)
-	}
-	if err != nil && len(token) == 0 {
-		return err
-	}
-	token = strings.TrimSpace(token)
-	if len(token) < 32 {
-		return errors.New("enrollment token is too short")
 	}
 	fmt.Fprint(os.Stderr, "Local VNC password (1-8 bytes): ")
 	vncPassword, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -366,7 +354,9 @@ func install(args []string) error {
 			return err
 		}
 	}
-	enrollment, err := agent.Enroll(*server, *machine, token, certificate)
+	enrollment, err := agent.EnrollWithApproval(*server, *machine, certificate, func(code string) {
+		fmt.Fprintf(os.Stderr, "Approve this diagnostic PC in the dashboard using verification code %s. Waiting for approval...\n", code)
+	})
 	if err != nil {
 		return err
 	}
