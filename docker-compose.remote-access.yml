@@ -1,6 +1,8 @@
 services:
   backend:
     environment:
+      # Phase 1 comparison only. Never include this overlay in an outbound production deployment.
+      REMOTE_ACCESS_MODE: inbound_lab
       VNC_GATEWAY_CA_CERT_FILE: /run/mtls/gateway-ca.crt
       VNC_GATEWAY_CLIENT_CERT_FILE: /run/mtls/gateway-client.crt
       VNC_GATEWAY_CLIENT_KEY_FILE: /run/mtls/gateway-client.key

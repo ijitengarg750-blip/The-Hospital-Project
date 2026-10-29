@@ -1,7 +1,7 @@
 {
   "machine_code": "SIRIUS-ROOM-2",
-  "server_url": "http://192.168.1.10:8080",
-  "api_key": "replace-with-the-COLLECTOR_API_KEY",
+  "server_url": "https://dashboard.hospital.example",
+  "collector_credential_file": "collector-credential.dat",
   "watch_folders": ["C:\\PACS_EXPORT"],
   "extensions": [".dcm"],
   "practo_uid_regex": "",
@@ -9,6 +9,7 @@
   "study_title": "Pupillography",
   "poll_seconds": 10,
   "stable_checks": 3,
-  "state_file": "state.json"
+  "state_file": "state.json",
+  "health_file": "health.json"
 }
 

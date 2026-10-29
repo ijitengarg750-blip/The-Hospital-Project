@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
+from hashlib import sha256
 from io import BytesIO
+import ssl
+import time
 
 import pytest
 
 from app.config import Settings
 from app.models import Machine
-from app.vnc_gateway import GatewayConfigurationError, MachineVncTarget, authenticate_vnc, load_machine_target, open_secure_transport
+from app.vnc_gateway import GatewayConfigurationError, MachineVncTarget, authenticate_vnc, load_machine_target, mint_tunnel_ticket, open_secure_transport, probe_secure_transport, validate_tunnel_ticket
 
 
 class ScriptedSocket:
@@ -70,4 +74,55 @@ def test_secure_transport_fails_closed_without_both_peer_certificates(tmp_path):
     })()
 
     with pytest.raises(GatewayConfigurationError, match="Mutual TLS"):
-        open_secure_transport(machine, network, Settings())
+        open_secure_transport(machine, network, Settings(), "session-1", "ticket")
+
+
+def test_tunnel_ticket_is_short_lived_session_specific_and_contains_no_agent_key():
+    key_hash = sha256(b"agent-secret").hexdigest()
+    ticket = mint_tunnel_ticket("session-1", key_hash)
+
+    encoded_payload, encoded_mac = ticket.split(".")
+    payload_bytes = base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
+    payload = payload_bytes.decode()
+    session_id, expires, nonce = payload.split("\n")
+    assert session_id == "session-1"
+    assert 0 < int(expires) - int(time.time()) <= 30
+    assert nonce
+    assert encoded_mac
+    assert "agent-secret" not in ticket
+    assert validate_tunnel_ticket("session-1", ticket, key_hash)
+    assert not validate_tunnel_ticket("session-2", ticket, key_hash)
+    assert not validate_tunnel_ticket("session-1", ticket + "x", key_hash)
+
+
+def test_secure_transport_sends_session_ticket_before_accepting_ready(monkeypatch):
+    channel = ScriptedSocket(b"HOSPITAL-RFB/2\n")
+    channel.settimeout = lambda _: None
+    channel.close = lambda: None
+    monkeypatch.setattr("app.vnc_gateway._open_secure_channel", lambda *_: channel)
+
+    connection = open_secure_transport(object(), object(), object(), "session-1", "signed-ticket")
+
+    assert connection is channel
+    assert channel.sent == b'{"session_id":"session-1","ticket":"signed-ticket"}\n'
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected"),
+    [
+        (ConnectionRefusedError(), "local bind health"),
+        (TimeoutError(), "firewall filtering"),
+        (ssl.SSLCertVerificationError(), "certificate validation"),
+    ],
+)
+def test_transport_probe_distinguishes_listener_network_and_tls_failures(monkeypatch, cause, expected):
+    def fail(*_):
+        raise GatewayConfigurationError("failed") from cause
+
+    monkeypatch.setattr("app.vnc_gateway._open_secure_channel", fail)
+
+    status, latency, error = probe_secure_transport(object(), object(), object())
+
+    assert status == "unreachable"
+    assert latency is None
+    assert expected in error

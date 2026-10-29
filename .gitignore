@@ -1,7 +1,9 @@
 .env
+.venv/
 __pycache__/
 .pytest_cache/
 *.pyc
+*.tsbuildinfo
 node_modules/
 dist/
 .tmp-go-cache/
@@ -15,6 +17,8 @@ deployment/test-tls/
 deployment/test-secrets/
 clinical-data/
 collector/state.json
+collector/*.json
+!collector/config.example.json
 collector/*.exe
 .vscode/
 

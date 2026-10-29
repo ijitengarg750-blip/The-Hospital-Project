@@ -11,6 +11,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,17 +20,34 @@ import (
 )
 
 type Config struct {
-	MachineCode    string   `json:"machine_code"`
-	ServerURL      string   `json:"server_url"`
-	APIKey         string   `json:"api_key"`
-	Folders        []string `json:"watch_folders"`
-	Extensions     []string `json:"extensions"`
-	PractoUIDRegex string   `json:"practo_uid_regex"`
-	StudyUIDRegex  string   `json:"study_uid_regex"`
-	StudyTitle     string   `json:"study_title"`
-	PollSeconds    int      `json:"poll_seconds"`
-	StableChecks   int      `json:"stable_checks"`
-	StateFile      string   `json:"state_file"`
+	MachineCode             string   `json:"machine_code"`
+	ServerURL               string   `json:"server_url"`
+	CollectorCredentialFile string   `json:"collector_credential_file"`
+	CollectorKey            string   `json:"-"`
+	Folders                 []string `json:"watch_folders"`
+	Extensions              []string `json:"extensions"`
+	PractoUIDRegex          string   `json:"practo_uid_regex"`
+	StudyUIDRegex           string   `json:"study_uid_regex"`
+	StudyTitle              string   `json:"study_title"`
+	PollSeconds             int      `json:"poll_seconds"`
+	StableChecks            int      `json:"stable_checks"`
+	StateFile               string   `json:"state_file"`
+	HealthFile              string   `json:"health_file"`
+}
+
+func (c *Config) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if _, exists := fields["collector_key"]; exists {
+		return errors.New("plaintext collector_key is not supported")
+	}
+	if _, exists := fields["api_key"]; exists {
+		return errors.New("plaintext api_key is not supported")
+	}
+	type configWithoutUnmarshal Config
+	return json.Unmarshal(data, (*configWithoutUnmarshal)(c))
 }
 
 type Failure struct {
@@ -43,6 +61,14 @@ type Failure struct {
 type State struct {
 	Uploaded map[string]string  `json:"uploaded"`
 	Failures map[string]Failure `json:"failures,omitempty"`
+}
+
+type CollectorHealth struct {
+	Status         string    `json:"status"`
+	CheckedAt      time.Time `json:"checked_at"`
+	UploadedFiles  int       `json:"uploaded_files"`
+	QueuedFailures int       `json:"queued_failures"`
+	LastError      string    `json:"last_error,omitempty"`
 }
 
 type uploadError struct {
@@ -59,7 +85,7 @@ func isPermanentFailure(err error) bool {
 	if !errors.As(err, &responseError) {
 		return false
 	}
-	return responseError.StatusCode >= 400 && responseError.StatusCode < 500 && responseError.StatusCode != http.StatusRequestTimeout && responseError.StatusCode != http.StatusTooManyRequests
+	return responseError.StatusCode >= 400 && responseError.StatusCode < 500 && responseError.StatusCode != http.StatusUnauthorized && responseError.StatusCode != http.StatusForbidden && responseError.StatusCode != http.StatusRequestTimeout && responseError.StatusCode != http.StatusTooManyRequests
 }
 
 func retryDelay(attempts int) time.Duration {
@@ -74,6 +100,30 @@ func retryDelay(attempts int) time.Duration {
 		return 15 * time.Minute
 	}
 	return delay
+}
+
+func validateServerURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return errors.New("server_url must be an absolute HTTPS URL")
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1") {
+		return nil
+	}
+	return errors.New("server_url must use HTTPS except for loopback development")
+}
+
+func migrateCredentialFailures(state *State) {
+	for key, failure := range state.Failures {
+		if failure.Permanent && (strings.Contains(failure.LastError, "HTTP 401") || strings.Contains(failure.LastError, "HTTP 403")) {
+			failure.Permanent = false
+			failure.NextAttempt = time.Time{}
+			state.Failures[key] = failure
+		}
+	}
 }
 
 func (s *State) shouldAttempt(key, digest string, now time.Time) bool {
@@ -117,6 +167,29 @@ func loadJSON(path string, target interface{}) error {
 
 func saveState(path string, state State) error {
 	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	temp := path + ".tmp"
+	if err = os.WriteFile(temp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(temp, path)
+}
+
+func saveHealth(path string, state State, lastError string) error {
+	status := "running"
+	if lastError != "" || len(state.Failures) > 0 {
+		status = "degraded"
+		if lastError == "" {
+			lastError = "uploads are queued for retry"
+		}
+	}
+	health := CollectorHealth{
+		Status: status, CheckedAt: time.Now().UTC(), LastError: lastError,
+		UploadedFiles: len(state.Uploaded), QueuedFailures: len(state.Failures),
+	}
+	data, err := json.MarshalIndent(health, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -212,8 +285,12 @@ func upload(cfg Config, path string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
-	req.Header.Set("X-Collector-Key", cfg.APIKey)
-	client := &http.Client{Timeout: 30 * time.Minute}
+	req.Header.Set("X-Machine-Code", cfg.MachineCode)
+	req.Header.Set("X-Collector-Key", cfg.CollectorKey)
+	client := &http.Client{
+		Timeout:       30 * time.Minute,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -236,20 +313,24 @@ func allowed(path string, extensions []string) bool {
 	return false
 }
 
-func scan(cfg Config, state *State) {
+func scan(cfg Config, state *State) string {
+	lastError := ""
 	for _, root := range cfg.Folders {
 		info, err := os.Stat(root)
 		if err != nil {
 			log.Printf("event=watch_folder_unavailable folder=%q error=%q", root, err)
+			lastError = "watch folder unavailable; see collector log"
 			continue
 		}
 		if !info.IsDir() {
 			log.Printf("event=watch_path_not_directory path=%q", root)
+			lastError = "watch path is not a directory; see collector log"
 			continue
 		}
 		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				log.Printf("cannot access %s: %v", path, err)
+				lastError = "watch folder access failed; see collector log"
 				return nil
 			}
 			if info == nil || info.IsDir() || !allowed(path, cfg.Extensions) {
@@ -276,9 +357,11 @@ func scan(cfg Config, state *State) {
 				return nil
 			}
 			if e = upload(cfg, path); e != nil {
+				lastError = "upload failed; see collector log"
 				state.recordFailure(key, digest, e, time.Now())
 				if saveErr := saveState(cfg.StateFile, *state); saveErr != nil {
 					log.Printf("event=state_save_failed file=%q error=%q", path, saveErr)
+					lastError = "collector state could not be saved"
 				}
 				failure := state.Failures[key]
 				status := "temporary_failure"
@@ -292,14 +375,27 @@ func scan(cfg Config, state *State) {
 			delete(state.Failures, key)
 			if e = saveState(cfg.StateFile, *state); e != nil {
 				log.Printf("event=state_save_failed file=%q error=%q", path, e)
+				lastError = "collector state could not be saved"
 			}
 			log.Printf("event=upload_accepted file=%q", path)
 			return nil
 		})
 	}
+	return lastError
 }
 
 func main() {
+	if len(os.Args) == 4 && os.Args[1] == "protect-credential" {
+		key, err := readCollectorKey()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err = createCollectorCredential(os.Args[2], key, os.Args[3]); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("DPAPI-protected collector credential written to %s", os.Args[2])
+		return
+	}
 	configPath := "config.json"
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
@@ -308,11 +404,11 @@ func main() {
 	if err := loadJSON(configPath, &cfg); err != nil {
 		log.Fatalf("cannot load config: %v", err)
 	}
-	if cfg.MachineCode == "" || cfg.ServerURL == "" || cfg.APIKey == "" || len(cfg.Folders) == 0 {
-		log.Fatal("machine_code, server_url, api_key and watch_folders are required")
-	}
 	if cfg.StateFile == "" {
 		cfg.StateFile = "state.json"
+	}
+	if cfg.HealthFile == "" {
+		cfg.HealthFile = "health.json"
 	}
 	configDir, err := filepath.Abs(filepath.Dir(configPath))
 	if err != nil {
@@ -320,6 +416,25 @@ func main() {
 	}
 	if !filepath.IsAbs(cfg.StateFile) {
 		cfg.StateFile = filepath.Join(configDir, cfg.StateFile)
+	}
+	if !filepath.IsAbs(cfg.HealthFile) {
+		cfg.HealthFile = filepath.Join(configDir, cfg.HealthFile)
+	}
+	if cfg.CollectorCredentialFile == "" {
+		log.Fatal("collector_credential_file is required; plaintext collector_key is not supported")
+	}
+	if !filepath.IsAbs(cfg.CollectorCredentialFile) {
+		cfg.CollectorCredentialFile = filepath.Join(configDir, cfg.CollectorCredentialFile)
+	}
+	cfg.CollectorKey, err = loadCollectorKey(cfg.CollectorCredentialFile)
+	if err != nil {
+		log.Fatalf("cannot load DPAPI-protected collector credential: %v", err)
+	}
+	if cfg.MachineCode == "" || cfg.ServerURL == "" || len(cfg.Folders) == 0 {
+		log.Fatal("machine_code, server_url and watch_folders are required")
+	}
+	if err := validateServerURL(cfg.ServerURL); err != nil {
+		log.Fatal(err)
 	}
 	for _, root := range cfg.Folders {
 		info, err := os.Stat(root)
@@ -347,9 +462,13 @@ func main() {
 	if state.Failures == nil {
 		state.Failures = map[string]Failure{}
 	}
+	migrateCredentialFailures(&state)
 	log.Printf("collector started for %s -> %s", cfg.MachineCode, strings.TrimRight(cfg.ServerURL, "/"))
 	for {
-		scan(cfg, &state)
+		lastError := scan(cfg, &state)
+		if err := saveHealth(cfg.HealthFile, state, lastError); err != nil {
+			log.Printf("event=health_save_failed error=%q", err)
+		}
 		time.Sleep(time.Duration(cfg.PollSeconds) * time.Second)
 	}
 }

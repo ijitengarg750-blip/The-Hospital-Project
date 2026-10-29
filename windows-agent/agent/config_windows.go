@@ -71,6 +71,49 @@ func LoadConfig(path string) (Config, error) {
 	return config, err
 }
 
+func SavePendingEnd(path, sessionID string) error {
+	plain, err := json.Marshal(struct {
+		SessionID string `json:"session_id"`
+	}{SessionID: sessionID})
+	if err != nil {
+		return err
+	}
+	protected, err := protect(plain)
+	for index := range plain {
+		plain[index] = 0
+	}
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, protected, 0600)
+}
+
+func LoadPendingEnd(path string) (string, error) {
+	protected, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	plain, err := unprotect(protected)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		for index := range plain {
+			plain[index] = 0
+		}
+	}()
+	var value struct {
+		SessionID string `json:"session_id"`
+	}
+	if err = json.Unmarshal(plain, &value); err != nil {
+		return "", err
+	}
+	return value.SessionID, nil
+}
+
 type WindowsCredential struct {
 	Username string `json:"username"`
 	Domain   string `json:"domain"`

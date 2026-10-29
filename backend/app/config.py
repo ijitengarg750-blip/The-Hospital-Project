@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,7 +13,6 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password: str = "change-me-admin"
     jwt_secret: str = "development-only-change-me"
-    collector_api_key: str = "development-collector-key"
     access_token_minutes: int = 480
     session_cookie_name: str = "hospital_session"
     session_cookie_secure: bool = True
@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     auth_window_minutes: int = 15
     max_upload_bytes: int = 2_000_000_000
     allowed_origins: str = "http://localhost:5173,http://localhost:8080"
+    remote_access_mode: Literal["disabled", "inbound_lab", "outbound"] = "disabled"
     vnc_targets_file: Path | None = None
     vnc_gateway_client_cert_file: Path | None = None
     vnc_gateway_client_key_file: Path | None = None

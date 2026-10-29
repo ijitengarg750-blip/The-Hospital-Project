@@ -2,23 +2,36 @@
 """Create one harmless text-only study for the two-laptop remote-access test."""
 
 import argparse
+from getpass import getpass
+import ipaddress
 import json
 from pathlib import Path
 import secrets
 import ssl
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler, Request
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_env() -> dict[str, str]:
-    values: dict[str, str] = {}
-    for raw in (ROOT / ".env").read_text(encoding="utf-8-sig").splitlines():
-        if raw.strip() and not raw.lstrip().startswith("#") and "=" in raw:
-            key, value = raw.split("=", 1)
-            values[key.strip()] = value.strip()
-    return values
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def validate_dashboard_url(raw: str) -> None:
+    parsed = urlparse(raw)
+    if not parsed.hostname:
+        raise SystemExit("Dashboard URL must be absolute")
+    if parsed.scheme == "https":
+        return
+    try:
+        is_loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        is_loopback = parsed.hostname == "localhost"
+    if parsed.scheme != "http" or not is_loopback:
+        raise SystemExit("Dashboard URL must use HTTPS except for loopback development")
 
 
 def field(boundary: str, name: str, value: str) -> bytes:
@@ -33,10 +46,15 @@ def main() -> None:
     parser.add_argument("--dashboard-url", required=True)
     parser.add_argument("--machine-code", default="SIRIUS-TEST-01")
     parser.add_argument("--ca-file", type=Path, default=ROOT / "deployment" / "test-tls" / "ca.crt")
+    parser.add_argument("--collector-config", type=Path, default=ROOT / "collector" / "config.json")
     args = parser.parse_args()
-    collector_key = load_env().get("COLLECTOR_API_KEY")
-    if not collector_key:
-        raise SystemExit("COLLECTOR_API_KEY is missing from .env")
+    validate_dashboard_url(args.dashboard_url)
+    collector_config = json.loads(args.collector_config.read_text(encoding="utf-8-sig"))
+    if collector_config.get("machine_code") != args.machine_code:
+        raise SystemExit("Collector config belongs to a different machine")
+    collector_key = getpass("Per-machine collector credential: ").strip()
+    if len(collector_key) < 32:
+        raise SystemExit("Collector credential is too short")
 
     boundary = "hospital-test-" + secrets.token_hex(12)
     study_uid = f"REMOTE-ACCESS-TEST-{args.machine_code}"
@@ -59,11 +77,15 @@ def main() -> None:
         method="POST",
         headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-Machine-Code": args.machine_code,
             "X-Collector-Key": collector_key,
         },
     )
     context = ssl.create_default_context(cafile=str(args.ca_file)) if request.full_url.startswith("https://") else None
-    with urlopen(request, context=context, timeout=30) as response:
+    handlers = [NoRedirectHandler()]
+    if context:
+        handlers.append(HTTPSHandler(context=context))
+    with build_opener(*handlers).open(request, timeout=30) as response:
         result = json.load(response)
     print(f"Created/reused study {result['study_uid']} with id {result['study_id']} for {args.machine_code}.")
 

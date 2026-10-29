@@ -62,10 +62,10 @@ Recommended server: Ubuntu 22.04/24.04 with a fixed LAN IP, at least 8 GB RAM, a
    docker compose up -d --build
    ```
 
-6. Open `http://SERVER_IP:8080` on the hospital LAN.
-7. Confirm `http://SERVER_IP:8080/api/health` returns `status: ok`.
+6. For local smoke testing only, open `http://localhost:8080` on the server.
+7. Before hospital use, place the dashboard behind the hospital's trusted HTTPS endpoint and confirm `https://DASHBOARD_HOST/api/health` returns `status: ok` from each diagnostic PC.
 
-Do not expose port 8080 directly to the public internet. Use it on the hospital LAN or behind the hospital VPN.
+Do not send credentials or patient traffic over LAN HTTP, and do not expose port 8080 to other machines. The pre-packaging phase is not deployment-ready until the HTTPS endpoint and certificate trust are validated.
 
 ## Register the first machine
 
@@ -93,17 +93,23 @@ Use x64 for 64-bit Windows and x86 for 32-bit Windows. The resulting executable 
 1. Create `C:\HospitalCollector`.
 2. Copy the correct collector executable to it as `hospital-collector.exe`.
 3. Copy `config.example.json` to `config.json`.
-4. Set `machine_code`, server IP, collector API key and actual PACS export folder.
-5. Run it manually once in Command Prompt:
+4. Set `machine_code`, server address, `collector_credential_file`, and the actual PACS export folder.
+5. Protect the one-time per-machine credential using the signed collector executable. Input is hidden and the JSON file never contains the key:
+
+   ```cmd
+   hospital-collector.exe protect-credential collector-credential.dat ".\HospitalCollectorSvc"
+   ```
+
+6. Run it manually once in Command Prompt:
 
    ```cmd
    cd C:\HospitalCollector
    hospital-collector.exe config.json
    ```
 
-6. Finish one test examination.
-7. Confirm the log says `uploaded` and the Practo UID appears in the dashboard.
-8. Install it as an automatic startup task using `deployment\install-collector-task.ps1` under a dedicated low-privilege Windows account.
+7. Finish one test examination.
+8. Confirm the log says `upload_accepted`, `health.json` is current, and the Practo UID appears in the dashboard.
+9. Install it as an automatic startup task using `deployment\install-collector-task.ps1` under a dedicated low-privilege Windows account. The task restarts only the collector after failure.
 
 The collector only reads source files. It never deletes or changes PACS exports.
 
@@ -114,8 +120,8 @@ The collector only reads source files. It never deletes or changes PACS exports.
 ```json
 {
   "machine_code": "SIRIUS-ROOM-2",
-  "server_url": "http://192.168.1.10:8080",
-  "api_key": "same value as COLLECTOR_API_KEY",
+  "server_url": "https://dashboard.hospital.example",
+  "collector_credential_file": "collector-credential.dat",
   "watch_folders": ["C:\\PACS_EXPORT"],
   "extensions": [".dcm"],
   "practo_uid_regex": "",
@@ -134,8 +140,8 @@ For a path such as `D:\Exports\10042\2026-10-21\report.pdf`:
 ```json
 {
   "machine_code": "OCT-ROOM-1",
-  "server_url": "http://192.168.1.10:8080",
-  "api_key": "same value as COLLECTOR_API_KEY",
+  "server_url": "https://dashboard.hospital.example",
+  "collector_credential_file": "collector-credential.dat",
   "watch_folders": ["D:\\Exports"],
   "extensions": [".pdf", ".jpg", ".mp4"],
   "practo_uid_regex": "Exports[\\\\/](\\d+)",

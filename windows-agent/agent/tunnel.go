@@ -3,22 +3,147 @@ package agent
 import (
 	"context"
 	"crypto/des"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
-const tunnelReady = "HOSPITAL-RFB/1\n"
+const tunnelReady = "HOSPITAL-RFB/2\n"
+
+type tunnelAuthorization struct {
+	SessionID string `json:"session_id"`
+	Ticket    string `json:"ticket"`
+}
+
+type TunnelAuthorizer struct {
+	mu        sync.Mutex
+	key       [sha256.Size]byte
+	sessionID string
+	used      bool
+	active    map[net.Conn]struct{}
+}
+
+func NewTunnelAuthorizer(agentKey string) *TunnelAuthorizer {
+	return &TunnelAuthorizer{key: sha256.Sum256([]byte(agentKey)), active: make(map[net.Conn]struct{})}
+}
+
+func (a *TunnelAuthorizer) Arm(sessionID string) {
+	a.mu.Lock()
+	a.sessionID = sessionID
+	a.used = false
+	a.mu.Unlock()
+}
+
+func (a *TunnelAuthorizer) IsArmed(sessionID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessionID == sessionID && !a.used
+}
+
+func (a *TunnelAuthorizer) Owns(sessionID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessionID == sessionID
+}
+
+func (a *TunnelAuthorizer) validTicket(sessionID, ticket string) bool {
+	parts := strings.Split(ticket, ".")
+	if len(parts) != 2 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, a.key[:])
+	_, _ = mac.Write(payload)
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return false
+	}
+	claims := strings.Split(string(payload), "\n")
+	if len(claims) != 3 || claims[0] != sessionID || claims[2] == "" {
+		return false
+	}
+	expires, err := strconv.ParseInt(claims[1], 10, 64)
+	if err != nil {
+		return false
+	}
+	remaining := time.Until(time.Unix(expires, 0))
+	return remaining >= 0 && remaining <= 35*time.Second
+}
+
+func (a *TunnelAuthorizer) Authorize(connection net.Conn, sessionID, ticket string) bool {
+	if !a.validTicket(sessionID, ticket) {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sessionID != sessionID || a.used {
+		return false
+	}
+	a.used = true
+	a.active[connection] = struct{}{}
+	return true
+}
+
+func (a *TunnelAuthorizer) Release(connection net.Conn) {
+	a.mu.Lock()
+	delete(a.active, connection)
+	a.mu.Unlock()
+}
+
+func (a *TunnelAuthorizer) Revoke(sessionID string) {
+	a.mu.Lock()
+	if a.sessionID != sessionID {
+		a.mu.Unlock()
+		return
+	}
+	a.sessionID = ""
+	a.used = true
+	connections := make([]net.Conn, 0, len(a.active))
+	for connection := range a.active {
+		connections = append(connections, connection)
+		delete(a.active, connection)
+	}
+	a.mu.Unlock()
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+}
+
+func writeTunnelAuthorization(connection io.Writer, sessionID, ticket string) error {
+	return json.NewEncoder(connection).Encode(tunnelAuthorization{SessionID: sessionID, Ticket: ticket})
+}
+
+func readTunnelAuthorization(connection io.Reader) (tunnelAuthorization, error) {
+	var authorization tunnelAuthorization
+	err := json.NewDecoder(io.LimitReader(connection, 1024)).Decode(&authorization)
+	if err != nil || authorization.SessionID == "" || len(authorization.SessionID) > 128 || authorization.Ticket == "" || len(authorization.Ticket) > 512 {
+		return tunnelAuthorization{}, errors.New("invalid tunnel authorization")
+	}
+	return authorization, nil
+}
 
 func GenerateMachineIdentity(machineCode string) (certificatePEM, privateKeyPEM string, err error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -149,21 +274,49 @@ func authenticateLocalVNC(connection net.Conn, password string) error {
 	return nil
 }
 
-func serveTunnelConnection(client net.Conn, config Config) {
+func CheckLocalVNC(ctx context.Context, address, password string) error {
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	connection, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return fmt.Errorf("connect to local VNC: %w", err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	if err = authenticateLocalVNC(connection, password); err != nil {
+		return fmt.Errorf("authenticate local VNC: %w", err)
+	}
+	return nil
+}
+
+func ValidateTunnelConfig(config Config) error {
+	_, err := tunnelTLSConfig(config)
+	return err
+}
+
+func serveTunnelConnection(client net.Conn, config Config, authorizer *TunnelAuthorizer) {
 	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
 	if tlsClient, ok := client.(*tls.Conn); ok {
 		if err := tlsClient.Handshake(); err != nil {
 			return
 		}
 	}
+	authorization, err := readTunnelAuthorization(client)
+	if err != nil || authorizer == nil || !authorizer.Authorize(client, authorization.SessionID, authorization.Ticket) {
+		return
+	}
+	defer authorizer.Release(client)
+	_ = client.SetDeadline(time.Time{})
 	upstream, err := net.DialTimeout("tcp", config.VNCAddress, 5*time.Second)
 	if err != nil {
 		return
 	}
 	defer upstream.Close()
+	_ = upstream.SetDeadline(time.Now().Add(5 * time.Second))
 	if err = authenticateLocalVNC(upstream, config.VNCPassword); err != nil {
 		return
 	}
+	_ = upstream.SetDeadline(time.Time{})
 	if _, err = client.Write([]byte(tunnelReady)); err != nil {
 		return
 	}
@@ -173,7 +326,10 @@ func serveTunnelConnection(client net.Conn, config Config) {
 	<-done
 }
 
-func ServeTunnel(ctx context.Context, listener net.Listener, config Config) error {
+func ServeTunnel(ctx context.Context, listener net.Listener, config Config, authorizer *TunnelAuthorizer) error {
+	if authorizer == nil {
+		return errors.New("tunnel authorizer is required")
+	}
 	tlsConfig, err := tunnelTLSConfig(config)
 	if err != nil {
 		return err
@@ -191,14 +347,14 @@ func ServeTunnel(ctx context.Context, listener net.Listener, config Config) erro
 			}
 			return err
 		}
-		go serveTunnelConnection(connection, config)
+		go serveTunnelConnection(connection, config, authorizer)
 	}
 }
 
-func RunTunnel(ctx context.Context, config Config) error {
+func RunTunnel(ctx context.Context, config Config, authorizer *TunnelAuthorizer) error {
 	listener, err := net.Listen("tcp", config.TunnelListen)
 	if err != nil {
 		return err
 	}
-	return ServeTunnel(ctx, listener, config)
+	return ServeTunnel(ctx, listener, config, authorizer)
 }

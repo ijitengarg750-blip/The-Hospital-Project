@@ -2,16 +2,22 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import base64
+import json
 import socket
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 import pytest
+from Crypto.Cipher import AES, PKCS1_OAEP
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from app import database, ingestion, machine_admin, main, security, vnc_gateway
+from app import database, ingestion, machine_admin, main, remote_sessions, security, vnc_gateway
 from app.config import Settings
 from app.database import Base, build_engine
 from app.models import Machine, Patient, Study
@@ -27,8 +33,9 @@ def client(tmp_path, monkeypatch):
         admin_username="test-admin",
         admin_password="admin-password",
         jwt_secret="test-secret-that-is-long-enough-for-a-disposable-suite",
-        collector_api_key="test-collector-key",
         session_cookie_secure=False,
+        allowed_origins="http://localhost:5173",
+        remote_access_mode="inbound_lab",
         vnc_gateway_ca_cert_file=(tmp_path / "gateway-ca.crt").resolve(),
     )
     settings.vnc_gateway_ca_cert_file.write_text("-----BEGIN CERTIFICATE-----\ntest-public-gateway-ca\n-----END CERTIFICATE-----\n", encoding="utf-8")
@@ -41,6 +48,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(security, "get_settings", lambda: settings)
     monkeypatch.setattr(vnc_gateway, "get_settings", lambda: settings)
     monkeypatch.setattr(machine_admin, "get_settings", lambda: settings)
+    monkeypatch.setattr(remote_sessions, "get_settings", lambda: settings)
+    from app import outbound_gateway
+    monkeypatch.setattr(outbound_gateway, "get_settings", lambda: settings)
     Base.metadata.create_all(engine)
     with TestClient(main.app) as test_client:
         test_client.test_settings = settings
@@ -78,13 +88,17 @@ def create_study() -> tuple[int, int]:
 
 
 def provision_agent(client: TestClient, machine_id: int, machine_code: str = "SIRIUS-1") -> tuple[str, dict[str, str]]:
-    issued = client.post(f"/api/machines/{machine_id}/enrollments", headers=admin_headers(client))
-    response = client.post("/api/agent/enroll", json={
-        "machine_code": machine_code,
-        "enrollment_token": issued.json()["enrollment_token"],
-    })
+    assert client.post(f"/api/machines/{machine_id}/enrollments", headers=admin_headers(client)).status_code == 201
+    private_key = RSA.generate(2048)
+    claim = client.post("/api/agent/enrollment-claims", json={"machine_code": machine_code, "public_key_pem": private_key.public_key().export_key().decode()}).json()
+    assert client.post(f"/api/machines/{machine_id}/enrollment-claims/approve", headers=admin_headers(client), json={"verification_code": claim["verification_code"]}).status_code == 204
+    response = client.post(f"/api/agent/enrollment-claims/{claim['claim_id']}/complete", json={})
     assert response.status_code == 201
-    key = response.json()["agent_key"]
+    encrypted = response.json()["encrypted_enrollment"]
+    content_key = PKCS1_OAEP.new(private_key, hashAlgo=SHA256).decrypt(base64.b64decode(encrypted["key"]))
+    cipher = AES.new(content_key, AES.MODE_GCM, nonce=base64.b64decode(encrypted["nonce"]))
+    decrypted = cipher.decrypt_and_verify(base64.b64decode(encrypted["ciphertext"]), base64.b64decode(encrypted["tag"]))
+    key = json.loads(decrypted)["agent_key"]
     return key, {"X-Machine-Code": machine_code, "X-Agent-Key": key}
 
 
@@ -347,4 +361,143 @@ def test_websocket_gateway_uses_the_pre_authenticated_encrypted_agent_tunnel(cli
 
     server_thread.join(timeout=2)
     assert observed == {"shared": b"\x01"}
+
+    from app.remote_sessions import RemoteSession
+    with database.SessionLocal() as db:
+        session = db.get(RemoteSession, session_id)
+        assert session.status == "failed"
+        assert session.active_slot is None
+        assert session.end_reason == "gateway_disconnected"
+
+
+def test_outbound_control_authenticates_heartbeats_and_receives_session_request(client):
+    client.test_settings.remote_access_mode = "outbound"
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+
+    with client.websocket_connect("/api/agent/control", headers=agent_headers) as control:
+        control.send_json({"type": "heartbeat", "state": "unlocked"})
+        assert control.receive_json()["type"] == "heartbeat_ack"
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            created = executor.submit(
+                client.post,
+                f"/api/studies/{study_id}/remote-sessions",
+                headers=doctor_headers(client),
+            ).result(timeout=5)
+        assert created.status_code == 201
+        command = control.receive_json()
+        assert command["type"] == "session_request"
+        assert command["session_id"] == created.json()["session"]["id"]
+        assert command["data_ticket"]
+
+
+def test_outbound_mode_never_falls_back_to_fresh_legacy_heartbeat(client):
+    client.test_settings.remote_access_mode = "outbound"
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+    assert client.post("/api/agent/heartbeat", headers=agent_headers, json={"state": "unlocked"}).status_code == 200
+
+    response = client.post(f"/api/studies/{study_id}/remote-sessions", headers=doctor_headers(client))
+
+    assert response.status_code == 409
+    assert "outbound connector" in response.json()["detail"].casefold()
+
+
+def test_outbound_data_ticket_is_consumed_once():
+    from app.outbound_gateway import OutboundHub
+
+    hub = OutboundHub()
+    assert hub.consume_ticket("session-ticket")
+    assert not hub.consume_ticket("session-ticket")
+
+
+def test_stale_control_cleanup_cannot_unregister_replacement():
+    from app.outbound_gateway import OutboundHub
+
+    hub = OutboundHub()
+    stale = object()
+    replacement = object()
+    hub._controls[1] = replacement
+
+    assert not hub.unregister(1, stale)
+    assert hub.is_connected(1)
+
+
+def test_outbound_data_stream_relays_the_existing_browser_protocol(client):
+    client.test_settings.remote_access_mode = "outbound"
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+    doctor = doctor_headers(client)
+
+    with client.websocket_connect("/api/agent/control", headers=agent_headers) as control:
+        control.send_json({"type": "heartbeat", "state": "unlocked"})
+        control.receive_json()
+        created = client.post(f"/api/studies/{study_id}/remote-sessions", headers=doctor).json()
+        command = control.receive_json()
+        session_id = created["session"]["id"]
+        data_headers = {**agent_headers, "X-Session-Ticket": command["data_ticket"]}
+        with client.websocket_connect(f"/api/agent/remote-sessions/{session_id}/data", headers=data_headers) as data:
+            control.send_json({"type": "session_ready", "session_id": session_id})
+            assert client.get(f"/api/remote-sessions/{session_id}", headers=doctor).json()["status"] == "ready"
+            access = client.post(
+                f"/api/remote-sessions/{session_id}/viewer-tickets",
+                headers=doctor,
+                json={"connection_grant": created["connection_grant"]},
+            ).json()
+            protocol = f"hospital-ticket.{access['viewer_ticket']}"
+            with client.websocket_connect(
+                access["websocket_path"],
+                headers={"origin": "http://localhost:5173"},
+                subprotocols=[protocol],
+            ) as browser:
+                assert browser.receive_bytes() == b"RFB 003.008\n"
+                browser.send_bytes(b"RFB 003.008\n")
+                assert browser.receive_bytes() == b"\x01\x01"
+                browser.send_bytes(b"\x01")
+                assert browser.receive_bytes() == b"\x00\x00\x00\x00"
+                browser.send_bytes(b"\x01")
+                assert data.receive_bytes() == b"\x01"
+                data.send_bytes(b"server-framebuffer-data")
+                assert browser.receive_bytes() == b"server-framebuffer-data"
+
+
+def test_outbound_heartbeat_expiry_fails_active_session(client):
+    from app.remote_sessions import MachineAgent, RemoteSession, cleanup_stale_remote_sessions
+
+    client.test_settings.remote_access_mode = "outbound"
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+    with client.websocket_connect("/api/agent/control", headers=agent_headers) as control:
+        control.send_json({"type": "heartbeat", "state": "unlocked"})
+        control.receive_json()
+        created = client.post(f"/api/studies/{study_id}/remote-sessions", headers=doctor_headers(client)).json()
+        session_id = created["session"]["id"]
+        with database.SessionLocal() as db:
+            db.get(MachineAgent, machine_id).last_seen_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+            db.commit()
+
+        cleanup_stale_remote_sessions()
+
+        with database.SessionLocal() as db:
+            session = db.get(RemoteSession, session_id)
+            assert session.status == "failed"
+            assert session.end_reason == "heartbeat_expired"
+
+
+def test_server_restart_reconciliation_never_reauthorizes_active_session(client):
+    from app.remote_sessions import RemoteSession, reconcile_remote_sessions_on_startup
+
+    machine_id, study_id = create_study()
+    _, agent_headers = provision_agent(client, machine_id)
+    client.post("/api/agent/heartbeat", headers=agent_headers, json={"state": "unlocked"})
+    created = client.post(f"/api/studies/{study_id}/remote-sessions", headers=doctor_headers(client)).json()
+
+    reconcile_remote_sessions_on_startup()
+
+    with database.SessionLocal() as db:
+        session = db.get(RemoteSession, created["session"]["id"])
+        assert session.status == "failed"
+        assert session.active_slot is None
+        assert session.end_reason == "server_restart"
 
