@@ -40,6 +40,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Windows agent build failed.' }
     & go.exe build -trimpath -buildvcs=false -o (Join-Path $payload 'hospital-remote-agent.exe') .\cmd\hospital-remote-agent
     if ($LASTEXITCODE -ne 0) { throw 'Windows agent build failed.' }
+    & go.exe build -trimpath -buildvcs=false -ldflags '-H=windowsgui' -o (Join-Path $payload 'hospital-installer-launcher.exe') .\cmd\hospital-installer-launcher
+    if ($LASTEXITCODE -ne 0) { throw 'Installer launcher build failed.' }
   } finally { Pop-Location }
 
   Push-Location (Join-Path $repoRoot 'collector')

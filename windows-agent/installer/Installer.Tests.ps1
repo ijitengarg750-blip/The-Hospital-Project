@@ -51,6 +51,7 @@ Describe 'Phase 3C MSI source' {
     $source.Contains('go.exe test ./...') | Should Be $true
     $source.Contains('go.exe build -trimpath') | Should Be $true
     $source.Contains("'hospital-remote-agent.exe'") | Should Be $true
+    $source.Contains("'hospital-installer-launcher.exe'") | Should Be $true
     $source.Contains("'hospital-collector.exe'") | Should Be $true
     $source.Contains('wix.exe') | Should Be $true
   }
@@ -95,6 +96,16 @@ Describe 'Phase 3C graphical configuration' {
     $source = Get-Content -Raw -LiteralPath $configurePath
     $source.Contains("-Verb RunAs") | Should Be $true
     $source.Contains("-ExecutionPolicy', 'AllSigned'") | Should Be $true
+  }
+
+  It 'uses advertised Start-menu shortcuts owned by their launcher component' {
+    [xml]$product = Get-Content -Raw -LiteralPath $productPath
+    $source = $product.OuterXml
+    $source.Contains('Id="InstallerLauncherExe"') | Should Be $true
+    $source.Contains('Arguments="configure"') | Should Be $true
+    $source.Contains('Arguments="uninstall [ProductCode]"') | Should Be $true
+    ([regex]::Matches($source, 'Advertise="yes"').Count) | Should Be 2
+    $source.Contains('Id="MenuShortcuts"') | Should Be $false
   }
 
   It 'keeps component failures independent' {

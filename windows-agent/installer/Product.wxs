@@ -14,7 +14,7 @@
       <Directory Id="INSTALLFOLDER" Name="Hospital Diagnostic Components" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="PROGRAMMENUDIR" Name="Hospital Diagnostic Components" />
+      <Directory Id="ProgramMenuDir" Name="Hospital Diagnostic Components" />
     </StandardDirectory>
 
     <DirectoryRef Id="INSTALLFOLDER">
@@ -34,26 +34,21 @@
         <File Id="RegisterNotificationScript" Source="$(var.PayloadDir)\Register-NotificationUI.ps1" />
       </Component>
       <Component Id="MaintenanceFiles" Guid="{0D7EC451-24CF-492B-88B2-F0621AD45EC5}" Bitness="always64">
-        <File Id="ConfigureInstallationScript" Source="$(var.PayloadDir)\Configure-Installation.ps1" KeyPath="yes" />
+        <File Id="ConfigureInstallationScript" Source="$(var.PayloadDir)\Configure-Installation.ps1" />
         <File Id="RemoveInstallationScript" Source="$(var.PayloadDir)\Remove-Installation.ps1" />
-      </Component>
-    </DirectoryRef>
-
-    <DirectoryRef Id="PROGRAMMENUDIR">
-      <Component Id="MenuShortcuts" Guid="{4C809747-986E-4C36-9E5B-072D6B66CF79}" Bitness="always64">
-        <RegistryValue Root="HKLM" Key="Software\Hospital Diagnostic Dashboard\Components" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
-        <Shortcut Id="ConfigureShortcut" Name="Configure diagnostic components" Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
-                  Arguments="-NoProfile -WindowStyle Hidden -ExecutionPolicy AllSigned -File &quot;[#ConfigureInstallationScript]&quot;" WorkingDirectory="INSTALLFOLDER" />
-        <Shortcut Id="UninstallShortcut" Name="Uninstall diagnostic components" Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
-                  Arguments="-NoProfile -WindowStyle Hidden -ExecutionPolicy AllSigned -File &quot;[#RemoveInstallationScript]&quot; -Prompt -ProductCode &quot;[ProductCode]&quot;" WorkingDirectory="INSTALLFOLDER" />
-        <RemoveFolder Id="RemoveProgramMenuDirectory" On="uninstall" />
+        <File Id="InstallerLauncherExe" Source="$(var.PayloadDir)\hospital-installer-launcher.exe" KeyPath="yes">
+          <Shortcut Id="ConfigureShortcut" Directory="ProgramMenuDir" Name="Configure diagnostic components" Advertise="yes"
+                    Arguments="configure" WorkingDirectory="INSTALLFOLDER" />
+          <Shortcut Id="UninstallShortcut" Directory="ProgramMenuDir" Name="Uninstall diagnostic components" Advertise="yes"
+                    Arguments="uninstall [ProductCode]" WorkingDirectory="INSTALLFOLDER" />
+        </File>
+        <RemoveFolder Id="RemoveProgramMenuDirectory" Directory="ProgramMenuDir" On="uninstall" />
       </Component>
     </DirectoryRef>
 
     <Feature Id="ConnectorFeature" Title="Remote Connector" Level="1" AllowAbsent="no">
       <ComponentRef Id="ConnectorFiles" />
       <ComponentRef Id="MaintenanceFiles" />
-      <ComponentRef Id="MenuShortcuts" />
     </Feature>
     <Feature Id="CollectorFeature" Title="Data Collector" Level="1">
       <ComponentRef Id="CollectorFiles" />
