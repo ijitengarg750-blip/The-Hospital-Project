@@ -347,6 +347,7 @@ def approve_enrollment_claim(machine_id: int, payload: EnrollmentClaimApprovalIn
         .join(MachineEnrollment, MachineEnrollment.id == MachineEnrollmentClaim.enrollment_id)
         .where(
             MachineEnrollment.machine_id == machine_id,
+            MachineEnrollment.used_at.is_(None),
             MachineEnrollmentClaim.verification_code == payload.verification_code,
             MachineEnrollmentClaim.used_at.is_(None),
             MachineEnrollmentClaim.expires_at > now,

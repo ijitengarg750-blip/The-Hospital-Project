@@ -179,6 +179,49 @@ def test_expired_enrollment_invitation_is_rejected(client):
     assert response.json()["detail"] == "No active enrollment invitation"
 
 
+def test_repeated_enrollment_attempts_require_a_new_invitation(client):
+    machine = register_machine(client)
+    assert client.post(f"/api/machines/{machine['id']}/enrollments").status_code == 201
+    public_key = RSA.generate(2048).public_key().export_key().decode()
+
+    claims = [
+        client.post("/api/agent/enrollment-claims", json={
+            "machine_code": machine["code"],
+            "public_key_pem": public_key,
+        })
+        for _ in range(5)
+    ]
+    assert all(response.status_code == 201 for response in claims)
+
+    blocked = client.post("/api/agent/enrollment-claims", json={
+        "machine_code": machine["code"],
+        "public_key_pem": public_key,
+    })
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"] == "Too many enrollment attempts; create a new invitation"
+
+    assert client.post(f"/api/machines/{machine['id']}/enrollments").status_code == 201
+    replacement = client.post("/api/agent/enrollment-claims", json={
+        "machine_code": machine["code"],
+        "public_key_pem": public_key,
+    })
+    assert replacement.status_code == 201
+
+    superseded_claim = claims[0].json()
+    stale_approval = client.post(
+        f"/api/machines/{machine['id']}/enrollment-claims/approve",
+        json={"verification_code": superseded_claim["verification_code"]},
+    )
+    assert stale_approval.status_code == 404
+    assert stale_approval.json()["detail"] == "Pending enrollment request not found"
+    rejected = client.post(
+        f"/api/agent/enrollment-claims/{superseded_claim['claim_id']}/complete",
+        json={},
+    )
+    assert rejected.status_code == 401
+    assert rejected.json()["detail"] == "Invalid or expired enrollment claim"
+
+
 def test_enrollment_claim_waits_for_matching_admin_approval(client):
     machine = register_machine(client)
     claim, _ = pair_machine(client, machine, approve=False)
