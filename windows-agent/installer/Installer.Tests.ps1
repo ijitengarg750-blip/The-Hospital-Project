@@ -132,4 +132,14 @@ Describe 'Phase 3C uninstall behavior' {
     $source.Contains("if (`$RemoveConfiguration -eq '1')") | Should Be $true
     $source.Contains('-Recurse') | Should Be $false
   }
+
+  It 'preserves enrollment credentials and queued report state by default' {
+    $source = Get-Content -Raw -LiteralPath $removePath
+    $source.Contains("[string]`$RemoveConfiguration = '0'") | Should Be $true
+    $source.Contains("if (`$RemoveConfiguration -eq '1')") | Should Be $true
+    $source.Contains("'service.dat'") | Should Be $true
+    $source.Contains("'collector-credential.dat'") | Should Be $true
+    $source.Contains("'state.json'") | Should Be $true
+    $source.Contains('.dcm') | Should Be $false
+  }
 }
