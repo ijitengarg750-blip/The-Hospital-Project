@@ -40,12 +40,13 @@ Do not install packages one at a time into global Python for this suite. Use Pyt
 | Preflight failures | `Preflight.Tests.ps1` and `Install-Agent.Tests.ps1` | Passed in the current Pester run |
 | Component-specific health reporting | `test_component_health_is_reported_independently_and_without_agent_details` and agent component tests | Passed in backend/Go verification |
 | Install, upgrade, repair, and rollback policy | `Installer.Tests.ps1`, MSI compilation, and unsuppressed WiX ICE validation | Passed for source/build validation; physical lifecycle is a Phase 4 gate |
-| Preserve enrollment credentials and queued reports | focused uninstall assertions, collector credential-rotation retry test, and report-ingestion continuity test | Passed for source/Go checks; current full backend rerun exceeded the local cutoff |
+| Preserve enrollment credentials and queued reports | focused uninstall assertions, collector credential-rotation retry test, and report-ingestion continuity test | Passed for source/Go checks and the subsequent full backend suite |
 | Independent component recovery | `TestComponentSupervisorRecoversAfterOnlyThatComponentStops` and independent MSI feature/task assertions | Passed in the current Go/Pester runs |
 | Correct errors and administrative permissions | machine-admin invitation, health, and doctor-permission tests | Passed in the Phase 3A suite plus the current focused regression |
 
 ## Current development verification
 
+- Full backend suite: `72 passed`.
 - Focused Python 3.12 regression: `1 passed, 7 warnings in 3.71s`.
 - Windows agent Go suite: passed for `agent`, `hospital-installer-launcher`, and `hospital-remote-agent`; the Windows authentication proof-of-concept has no tests.
 - Collector Go suite: passed, including queued-report retry and credential-rotation coverage.
@@ -53,7 +54,7 @@ Do not install packages one at a time into global Python for this suite. Use Pyt
 - Frontend TypeScript and Vite production build: passed. Vite emitted existing third-party `use client` directive warnings from `lucide-react`.
 - Phase 3C MSI compilation and unsuppressed WiX ICE validation were previously confirmed with exit code `0` for `windows-agent\installer\out\HospitalDiagnosticComponents-0.1.0-x64.msi`.
 
-The current full backend rerun was stopped after exceeding the requested 30-second tool cutoff, so it is `Not Tested` in this final run rather than silently treated as passed. Run it from `backend` with the disposable Python 3.12 interpreter:
+An earlier full backend rerun was stopped after exceeding the requested 30-second tool cutoff. A subsequent full backend run completed successfully with `72 passed`. Run it from `backend` with the disposable Python 3.12 interpreter:
 
 ```powershell
 & "$env:TEMP\hospital-backend-py312\Scripts\python.exe" -m pytest -q `
