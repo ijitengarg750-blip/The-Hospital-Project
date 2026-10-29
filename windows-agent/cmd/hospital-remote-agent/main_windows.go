@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -391,6 +392,14 @@ func install(args []string) error {
 	if err := exec.Command("icacls", uiConfig, "/inheritance:r", "/grant:r", "SYSTEM:F", "Administrators:F", *uiUser+":R").Run(); err != nil {
 		return fmt.Errorf("secure UI config ACL: %w", err)
 	}
+	return ensureService(serviceConfig)
+}
+
+func serviceBinaryPath(executable, configPath string) string {
+	return strings.Join([]string{syscall.EscapeArg(executable), "service", syscall.EscapeArg(configPath)}, " ")
+}
+
+func ensureService(configPath string) error {
 	executable, err := os.Executable()
 	if err != nil {
 		return err
@@ -400,16 +409,88 @@ func install(args []string) error {
 		return err
 	}
 	defer manager.Disconnect()
-	service, err := manager.CreateService(serviceName, executable, mgr.Config{DisplayName: "Hospital Remote Diagnostic Agent", Description: "Authorizes and controls audited diagnostic remote sessions.", StartType: mgr.StartAutomatic}, "service", serviceConfig)
+	service, err := manager.OpenService(serviceName)
+	created := false
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		service, err = manager.CreateService(serviceName, executable, mgr.Config{DisplayName: "Hospital Remote Diagnostic Agent", Description: "Authorizes and controls audited diagnostic remote sessions.", StartType: mgr.StartAutomatic}, "service", configPath)
+		created = err == nil
+	} else if err == nil {
+		if stopErr := stopService(service); stopErr != nil {
+			service.Close()
+			return stopErr
+		}
+		config, configErr := service.Config()
+		if configErr != nil {
+			service.Close()
+			return configErr
+		}
+		config.BinaryPathName = serviceBinaryPath(executable, configPath)
+		config.DisplayName = "Hospital Remote Diagnostic Agent"
+		config.Description = "Authorizes and controls audited diagnostic remote sessions."
+		config.StartType = mgr.StartAutomatic
+		config.ServiceStartName = "LocalSystem"
+		config.Password = ""
+		err = service.UpdateConfig(config)
+	}
 	if err != nil {
 		return err
 	}
 	defer service.Close()
 	if err = eventlog.InstallAsEventCreate(serviceName, eventlog.Error|eventlog.Warning|eventlog.Info); err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-		_ = service.Delete()
+		if created {
+			_ = service.Delete()
+		}
 		return fmt.Errorf("register Windows Event Log source: %w", err)
 	}
-	return service.Start()
+	err = service.Start()
+	if err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return err
+	}
+	if output, failureErr := exec.Command("sc.exe", "failure", serviceName, "reset=", "86400", "actions=", "restart/5000/restart/15000/restart/30000").CombinedOutput(); failureErr != nil {
+		return fmt.Errorf("configure service recovery: %w: %s", failureErr, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func stopService(service *mgr.Service) error {
+	status, err := service.Query()
+	if err != nil {
+		return err
+	}
+	if status.State == svc.Stopped {
+		return nil
+	}
+	if _, err = service.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		return fmt.Errorf("stop service for repair: %w", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err = service.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return errors.New("service did not stop within 30 seconds")
+}
+
+func repairService(configPath string) error {
+	if _, err := agent.LoadConfig(configPath); err != nil {
+		return fmt.Errorf("load existing enrollment: %w", err)
+	}
+	return ensureService(configPath)
+}
+
+func repairServiceIfConfigured(configPath string) error {
+	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return repairService(configPath)
 }
 
 func uninstall() error {
@@ -477,7 +558,7 @@ func runConsole(configPath string) error {
 
 func run(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: hospital-remote-agent install|uninstall|service|console|preflight")
+		return errors.New("usage: hospital-remote-agent install|repair-service|repair-service-if-configured|uninstall|service|console|preflight")
 	}
 	var err error
 	switch args[0] {
@@ -485,6 +566,18 @@ func run(args []string) error {
 		err = install(args[1:])
 	case "uninstall":
 		err = uninstall()
+	case "repair-service":
+		if len(args) != 2 {
+			err = errors.New("repair-service requires the existing config path")
+		} else {
+			err = repairService(args[1])
+		}
+	case "repair-service-if-configured":
+		if len(args) != 2 {
+			err = errors.New("repair-service-if-configured requires the expected config path")
+		} else {
+			err = repairServiceIfConfigured(args[1])
+		}
 	case "service":
 		if len(args) != 2 {
 			err = errors.New("service config path is required")
@@ -509,7 +602,7 @@ func run(args []string) error {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: hospital-remote-agent install|uninstall|service|console|preflight")
+		fmt.Fprintln(os.Stderr, "usage: hospital-remote-agent install|repair-service|repair-service-if-configured|uninstall|service|console|preflight")
 		os.Exit(2)
 	}
 	err := run(os.Args[1:])

@@ -29,6 +29,7 @@ Describe 'Windows installation preflight contract' {
 
   It 'distinguishes clean, existing, and partial installations' {
     (Get-InstallStateResult -ServiceExists $false -BinaryExists $false -ConfigExists $false).Status | Should Be 'Passed'
+    (Get-InstallStateResult -ServiceExists $false -BinaryExists $true -ConfigExists $false -StagedBinary).Status | Should Be 'Passed'
     (Get-InstallStateResult -ServiceExists $true -BinaryExists $true -ConfigExists $true).Status | Should Be 'Warning'
     (Get-InstallStateResult -ServiceExists $true -BinaryExists $false -ConfigExists $false).Status | Should Be 'Failed'
   }

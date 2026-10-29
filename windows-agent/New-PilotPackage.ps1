@@ -55,6 +55,7 @@ Copy-Item -LiteralPath $agentOutput -Destination (Join-Path $buildDirectory 'hos
 Copy-Item -LiteralPath (Join-Path $source 'Install-Agent.ps1') -Destination (Join-Path $OutputDirectory 'Install-Agent.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Uninstall-Agent.ps1') -Destination (Join-Path $OutputDirectory 'Uninstall-Agent.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $source 'Preflight.ps1') -Destination (Join-Path $OutputDirectory 'Preflight.ps1') -Force
+Copy-Item -LiteralPath (Join-Path $source 'Register-NotificationUI.ps1') -Destination (Join-Path $OutputDirectory 'Register-NotificationUI.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $source 'ui\HospitalRemoteUI.ps1') -Destination (Join-Path $uiDirectory 'HospitalRemoteUI.ps1') -Force
 Copy-Item -LiteralPath $publicCertificatePath -Destination (Join-Path $OutputDirectory 'HospitalDashboardPilot.cer') -Force
 Copy-Item -LiteralPath (Join-Path $source 'PILOT-TEST.md') -Destination (Join-Path $OutputDirectory 'README.md') -Force
@@ -67,6 +68,7 @@ $scripts = @(
   (Join-Path $OutputDirectory 'Install-Agent.ps1'),
   (Join-Path $OutputDirectory 'Uninstall-Agent.ps1'),
   (Join-Path $OutputDirectory 'Preflight.ps1'),
+  (Join-Path $OutputDirectory 'Register-NotificationUI.ps1'),
   (Join-Path $uiDirectory 'HospitalRemoteUI.ps1')
 )
 foreach ($script in $scripts) {

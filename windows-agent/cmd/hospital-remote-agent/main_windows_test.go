@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,5 +36,21 @@ func TestPreflightCommandHasNoInstallationSideEffects(t *testing.T) {
 	}
 	if err := run([]string{"preflight", "unexpected"}); err == nil {
 		t.Fatal("preflight accepted an unexpected argument")
+	}
+}
+
+func TestRepairServiceRejectsUnexpectedArguments(t *testing.T) {
+	if err := run([]string{"repair-service", "one", "two"}); err == nil {
+		t.Fatal("repair-service accepted an unexpected argument")
+	}
+	if err := run([]string{"repair-service-if-configured", "one", "two"}); err == nil {
+		t.Fatal("repair-service-if-configured accepted an unexpected argument")
+	}
+}
+
+func TestServiceBinaryPathQuotesInstalledExecutable(t *testing.T) {
+	command := serviceBinaryPath(`C:\Program Files\Hospital Diagnostics\hospital-remote-agent.exe`, `C:\ProgramData\HospitalRemoteAgent\service.dat`)
+	if !strings.HasPrefix(command, `"C:\Program Files\Hospital Diagnostics\hospital-remote-agent.exe" service `) {
+		t.Fatalf("service command did not quote executable: %s", command)
 	}
 }

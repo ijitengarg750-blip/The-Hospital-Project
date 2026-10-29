@@ -28,16 +28,30 @@ Describe 'Install-Agent signature preflight' {
   }
 
   It 'uses a restartable per-user task instead of a startup launcher' {
-    $installer.Contains("'Hospital Remote Notification UI'") | Should Be $true
-    $installer.Contains("RestartCount = 5") | Should Be $true
-    $installer.Contains("RestartInterval = 'PT1M'") | Should Be $true
+    $notificationInstaller = Get-Content -Raw (Join-Path $PSScriptRoot 'Register-NotificationUI.ps1')
+    $notificationInstaller.Contains("'Hospital Remote Notification UI'") | Should Be $true
+    $notificationInstaller.Contains("RestartCount = 5") | Should Be $true
+    $notificationInstaller.Contains("RestartInterval = 'PT1M'") | Should Be $true
     $installer.Contains("'HospitalRemoteUI.lnk'") | Should Be $false
     $installer.Contains("'HospitalRemoteUI.cmd'") | Should Be $false
   }
 
   It 'runs only the signed UI script under an interactive user token' {
+    $notificationInstaller = Get-Content -Raw (Join-Path $PSScriptRoot 'Register-NotificationUI.ps1')
     $installer.Contains('-ExecutionPolicy AllSigned') | Should Be $true
-    $installer.Contains('LogonType = 3') | Should Be $true
+    $notificationInstaller.Contains('-ExecutionPolicy AllSigned') | Should Be $true
+    $notificationInstaller.Contains('LogonType = 3') | Should Be $true
+  }
+
+  It 'supports the MSI-installed layout and independent notification setup' {
+    $installer.Contains('[switch]$InstalledLayout') | Should Be $true
+    $installer.Contains('[switch]$SkipNotificationUI') | Should Be $true
+    $installer.Contains('[Security.SecureString]$VNCPassword') | Should Be $true
+    $installer.Contains("'Register-NotificationUI.ps1'") | Should Be $true
+  }
+
+  It 'configures connector service recovery independently' {
+    $installer.Contains('sc.exe failure HospitalRemoteAgent reset= 86400 actions= restart/5000/restart/15000/restart/30000') | Should Be $true
   }
 }
 
@@ -46,7 +60,20 @@ Describe 'Collector credential ACL' {
     $collectorInstaller = Get-Content -Raw (Join-Path $PSScriptRoot '..\deployment\install-collector-task.ps1')
     $collectorInstaller.Contains('SetAccessRuleProtection($true, $false)') | Should Be $true
     $collectorInstaller.Contains('Set-Acl -LiteralPath $CredentialFile') | Should Be $true
+    $collectorInstaller.Contains('Set-Acl -LiteralPath $DataDirectory') | Should Be $true
     $collectorInstaller.Contains('icacls $CredentialFile') | Should Be $false
+  }
+
+  It 'supports MSI-managed executable and preserved data paths' {
+    $collectorInstaller = Get-Content -Raw (Join-Path $PSScriptRoot '..\deployment\install-collector-task.ps1')
+    $collectorInstaller.Contains('[string]$CollectorExecutable') | Should Be $true
+    $collectorInstaller.Contains('[string]$ConfigPath') | Should Be $true
+  }
+
+  It 'does not expose the collector account password on a process command line' {
+    $collectorInstaller = Get-Content -Raw (Join-Path $PSScriptRoot '..\deployment\install-collector-task.ps1')
+    $collectorInstaller.Contains('schtasks.exe') | Should Be $false
+    $collectorInstaller.Contains('RegisterTaskDefinition') | Should Be $true
   }
 }
 
@@ -62,5 +89,11 @@ Describe 'New-PilotPackage defaults' {
     $packageScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'New-PilotPackage.ps1')
     $packageScript.Contains("'Preflight.ps1'") | Should Be $true
     $packageScript.Contains("(Join-Path `$OutputDirectory 'Preflight.ps1')") | Should Be $true
+  }
+
+  It 'packages and signs the notification task installer' {
+    $packageScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'New-PilotPackage.ps1')
+    $packageScript.Contains("'Register-NotificationUI.ps1'") | Should Be $true
+    $packageScript.Contains("(Join-Path `$OutputDirectory 'Register-NotificationUI.ps1')") | Should Be $true
   }
 }

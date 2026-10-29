@@ -2,12 +2,22 @@ param(
   [Parameter(Mandatory=$true)][string]$Server,
   [Parameter(Mandatory=$true)][string]$MachineCode,
   [Parameter(Mandatory=$true)][string]$UIUser,
+  [Security.SecureString]$VNCPassword,
+  [switch]$InstalledLayout,
+  [switch]$SkipNotificationUI,
   [switch]$Legacy
 )
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal $identity
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this installer from an elevated PowerShell window.' }
+
+$serverUri = $null
+if (-not [Uri]::TryCreate($Server, [UriKind]::Absolute, [ref]$serverUri) -or $serverUri.Scheme -ne 'https' -or $serverUri.Port -ne 443 -or -not [string]::IsNullOrEmpty($serverUri.UserInfo) -or -not [string]::IsNullOrEmpty($serverUri.Query) -or -not [string]::IsNullOrEmpty($serverUri.Fragment)) {
+  throw 'Server must be an HTTPS URL on port 443 without embedded credentials, a query, or a fragment.'
+}
+if ($MachineCode -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw 'MachineCode contains unsupported characters.' }
+try { (New-Object Security.Principal.NTAccount($UIUser)).Translate([Security.Principal.SecurityIdentifier]) | Out-Null } catch { throw "UIUser is not a valid local or domain account: $UIUser" }
 
 function Assert-ValidPilotSignature {
   param(
@@ -27,16 +37,21 @@ function Assert-ValidPilotSignature {
 $source = Split-Path -Parent $MyInvocation.MyCommand.Path
 $preflight = Join-Path $source 'Preflight.ps1'
 $powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
-& $powerShell -NoProfile -ExecutionPolicy AllSigned -File $preflight -Server $Server
+if ($InstalledLayout) {
+  & $powerShell -NoProfile -ExecutionPolicy AllSigned -File $preflight -Server $Server -InstalledLayout
+} else {
+  & $powerShell -NoProfile -ExecutionPolicy AllSigned -File $preflight -Server $Server
+}
 if ($LASTEXITCODE -ne 0) { throw 'Windows installation preflight failed.' }
-$destination = Join-Path $env:ProgramFiles 'HospitalRemoteAgent'
+$destination = if ($InstalledLayout) { $source } else { Join-Path $env:ProgramFiles 'HospitalRemoteAgent' }
 $osVersion = [Version](Get-WmiObject Win32_OperatingSystem).Version
 $isLegacyOS = $osVersion.Major -lt 10
 if ($isLegacyOS -and -not $Legacy) { throw 'Windows 7/8/8.1 requires -Legacy and a Go 1.20-built legacy artifact.' }
 $architecture = if ($env:PROCESSOR_ARCHITEW6432 -eq 'AMD64' -or $env:PROCESSOR_ARCHITECTURE -eq 'AMD64') { 'amd64' } else { '386' }
 $flavor = if ($Legacy) { "legacy-$architecture" } else { 'modern-amd64' }
-$agentBinary = Join-Path $source "build\$flavor\hospital-remote-agent.exe"
-$uiScript = Join-Path $source 'ui\HospitalRemoteUI.ps1'
+$agentBinary = if ($InstalledLayout) { Join-Path $source 'hospital-remote-agent.exe' } else { Join-Path $source "build\$flavor\hospital-remote-agent.exe" }
+$uiScript = if ($InstalledLayout) { Join-Path $source 'HospitalRemoteUI.ps1' } else { Join-Path $source 'ui\HospitalRemoteUI.ps1' }
+$notificationInstaller = Join-Path $source 'Register-NotificationUI.ps1'
 $installerSignature = Get-AuthenticodeSignature -LiteralPath $MyInvocation.MyCommand.Path
 if ($installerSignature.Status -ne 'Valid' -or -not $installerSignature.SignerCertificate) {
   throw "The installer signature is not valid: $($installerSignature.Status) $($installerSignature.StatusMessage)"
@@ -44,38 +59,53 @@ if ($installerSignature.Status -ne 'Valid' -or -not $installerSignature.SignerCe
 $expectedThumbprint = $installerSignature.SignerCertificate.Thumbprint
 Assert-ValidPilotSignature -Path $agentBinary -ExpectedThumbprint $expectedThumbprint
 Assert-ValidPilotSignature -Path $uiScript -ExpectedThumbprint $expectedThumbprint
-$account = New-Object Security.Principal.NTAccount $UIUser
-$sid = $account.Translate([Security.Principal.SecurityIdentifier]).Value
-New-Item -ItemType Directory -Path $destination -Force | Out-Null
-Copy-Item $agentBinary (Join-Path $destination 'hospital-remote-agent.exe') -Force
-Copy-Item $uiScript $destination -Force
+Assert-ValidPilotSignature -Path $notificationInstaller -ExpectedThumbprint $expectedThumbprint
+if (-not $InstalledLayout) {
+  New-Item -ItemType Directory -Path $destination -Force | Out-Null
+  Copy-Item $agentBinary (Join-Path $destination 'hospital-remote-agent.exe') -Force
+  Copy-Item $uiScript $destination -Force
+  Copy-Item $notificationInstaller $destination -Force
+}
 
 Write-Host 'The agent will show a verification code. Approve the matching code on the Diagnostic Machines page.'
-& (Join-Path $destination 'hospital-remote-agent.exe') install --server $Server --machine $MachineCode --ui-user $UIUser
-if ($LASTEXITCODE -ne 0) { throw 'Agent service installation failed.' }
-
-$taskService = New-Object -ComObject 'Schedule.Service'
-$taskService.Connect()
-$taskFolder = $taskService.GetFolder('\')
-$task = $taskService.NewTask(0)
-$task.RegistrationInfo.Description = 'Shows local remote-session notices and the offline emergency stop.'
-$task.Principal.UserId = $UIUser
-$task.Principal.LogonType = 3
-$task.Principal.RunLevel = 0
-$trigger = $task.Triggers.Create(9)
-$trigger.UserId = $UIUser
-$trigger.Enabled = $true
-$action = $task.Actions.Create(0)
-$action.Path = $powerShell
-$action.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy AllSigned -File `"$destination\HospitalRemoteUI.ps1`""
-$action.WorkingDirectory = $destination
-$task.Settings.RestartCount = 5
-$task.Settings.RestartInterval = 'PT1M'
-$task.Settings.ExecutionTimeLimit = 'PT0S'
-$taskFolder.RegisterTaskDefinition('Hospital Remote Notification UI', $task, 6, $UIUser, $null, 3, $null) | Out-Null
-if ($identity.User.Value -eq $sid) {
-	$taskFolder.GetTask('Hospital Remote Notification UI').Run($null) | Out-Null
+if ($VNCPassword) {
+  $start = New-Object Diagnostics.ProcessStartInfo
+  $start.FileName = Join-Path $destination 'hospital-remote-agent.exe'
+  $start.Arguments = "install --server `"$Server`" --machine `"$MachineCode`" --ui-user `"$UIUser`""
+  $start.UseShellExecute = $false
+  $start.RedirectStandardInput = $true
+  $start.RedirectStandardError = $true
+  $start.CreateNoWindow = $true
+  $process = New-Object Diagnostics.Process
+  $process.StartInfo = $start
+  $pointer = [IntPtr]::Zero
+  try {
+    if (-not $process.Start()) { throw 'Could not start the Remote Connector installer.' }
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($VNCPassword)
+    $process.StandardInput.WriteLine([Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer))
+    $process.StandardInput.Close()
+    while (-not $process.StandardError.EndOfStream) {
+      $line = $process.StandardError.ReadLine()
+      if ($line -match 'verification code ([0-9]{6})') {
+        Add-Type -AssemblyName System.Windows.Forms
+        [Windows.Forms.MessageBox]::Show("Approve this diagnostic PC on the Diagnostic Machines page using code $($Matches[1]).", 'Approve enrollment', 'OK', 'Information') | Out-Null
+      }
+    }
+    $process.WaitForExit()
+    $agentExitCode = $process.ExitCode
+  } finally {
+    if ($pointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+    $process.Dispose()
+  }
+} else {
+  & (Join-Path $destination 'hospital-remote-agent.exe') install --server $Server --machine $MachineCode --ui-user $UIUser
+  $agentExitCode = $LASTEXITCODE
 }
+if ($agentExitCode -ne 0) { throw 'Agent service installation failed.' }
+& sc.exe failure HospitalRemoteAgent reset= 86400 actions= restart/5000/restart/15000/restart/30000 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Remote Connector recovery policy configuration failed.' }
+
+if (-not $SkipNotificationUI) { & (Join-Path $destination 'Register-NotificationUI.ps1') -UIUser $UIUser -InstallDirectory $destination }
 Write-Host 'Hospital Remote Agent installed. The notification application starts at the UI user sign-in and restarts independently after failure.'
 
 # SIG # Begin signature block

@@ -2,6 +2,7 @@
 param(
   [string]$Server,
   [string]$PackageRoot,
+  [switch]$InstalledLayout,
   [switch]$Json
 )
 
@@ -43,8 +44,11 @@ function Get-LoopbackResult {
 }
 
 function Get-InstallStateResult {
-  param([bool]$ServiceExists, [bool]$BinaryExists, [bool]$ConfigExists)
+  param([bool]$ServiceExists, [bool]$BinaryExists, [bool]$ConfigExists, [switch]$StagedBinary)
   $present = @($ServiceExists, $BinaryExists, $ConfigExists | Where-Object { $_ }).Count
+  if ($StagedBinary -and -not $ServiceExists -and -not $ConfigExists) {
+    return New-PreflightResult 'Existing installation and enrollment' 'Passed' 'No existing Hospital Remote Agent service or enrollment was found; the installer-staged binary is ready to configure.'
+  }
   if ($present -eq 0) {
     return New-PreflightResult 'Existing installation and enrollment' 'Passed' 'No existing Hospital Remote Agent installation or enrollment was found.'
   }
@@ -55,14 +59,19 @@ function Get-InstallStateResult {
 }
 
 function Get-SignatureResult {
-  param([string]$Root)
-  $paths = @(
-    (Join-Path $Root 'Preflight.ps1'),
-    (Join-Path $Root 'Install-Agent.ps1'),
-    (Join-Path $Root 'Uninstall-Agent.ps1'),
-    (Join-Path $Root 'ui\HospitalRemoteUI.ps1'),
-    (Join-Path $Root 'build\modern-amd64\hospital-remote-agent.exe')
-  )
+  param([string]$Root, [switch]$Installed)
+  $paths = if ($Installed) {
+    @('Preflight.ps1', 'Install-Agent.ps1', 'Uninstall-Agent.ps1', 'Register-NotificationUI.ps1', 'HospitalRemoteUI.ps1', 'hospital-remote-agent.exe', 'hospital-collector.exe', 'install-collector-task.ps1', 'Configure-Installation.ps1', 'Remove-Installation.ps1') | ForEach-Object { Join-Path $Root $_ }
+  } else {
+    @(
+      (Join-Path $Root 'Preflight.ps1'),
+      (Join-Path $Root 'Install-Agent.ps1'),
+      (Join-Path $Root 'Uninstall-Agent.ps1'),
+      (Join-Path $Root 'Register-NotificationUI.ps1'),
+      (Join-Path $Root 'ui\HospitalRemoteUI.ps1'),
+      (Join-Path $Root 'build\modern-amd64\hospital-remote-agent.exe')
+    )
+  }
   $thumbprint = $null
   foreach ($path in $paths) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -165,7 +174,12 @@ function Get-FilesystemResult {
   if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     return New-PreflightResult 'Filesystem permissions' 'Failed' 'Run preflight from an elevated administrator session so protected installation paths can be checked.'
   }
-  foreach ($path in @((Join-Path $env:ProgramFiles 'HospitalRemoteAgent'), (Join-Path $env:ProgramData 'HospitalRemoteAgent'))) {
+  foreach ($path in @(
+    (Join-Path $env:ProgramFiles 'HospitalRemoteAgent'),
+    (Join-Path $env:ProgramFiles 'Hospital Diagnostic Components'),
+    (Join-Path $env:ProgramData 'HospitalRemoteAgent'),
+    (Join-Path $env:ProgramData 'HospitalDataCollector')
+  )) {
     if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
     $unsafe = @(Get-Acl -LiteralPath $path).Access | Where-Object {
       $_.AccessControlType -eq 'Allow' -and
@@ -203,18 +217,18 @@ function Get-PreflightExitCode {
 }
 
 function Invoke-HospitalPreflight {
-  param([Parameter(Mandatory=$true)][string]$DashboardServer, [string]$Root = $PSScriptRoot)
-  $program = Join-Path $env:ProgramFiles 'HospitalRemoteAgent\hospital-remote-agent.exe'
+  param([Parameter(Mandatory=$true)][string]$DashboardServer, [string]$Root = $PSScriptRoot, [switch]$Installed)
+  $program = if ($Installed) { Join-Path $Root 'hospital-remote-agent.exe' } else { Join-Path $env:ProgramFiles 'HospitalRemoteAgent\hospital-remote-agent.exe' }
   $data = Join-Path $env:ProgramData 'HospitalRemoteAgent\service.dat'
   $service = Get-Service -Name 'HospitalRemoteAgent' -ErrorAction SilentlyContinue
-  $packageAgent = Join-Path $Root 'build\modern-amd64\hospital-remote-agent.exe'
-  $signature = Get-SignatureResult $Root
+  $packageAgent = if ($Installed) { Join-Path $Root 'hospital-remote-agent.exe' } else { Join-Path $Root 'build\modern-amd64\hospital-remote-agent.exe' }
+  $signature = Get-SignatureResult $Root -Installed:$Installed
   @(
     Get-PlatformResult
     $signature
     Get-AppControlResult $packageAgent ($signature.Status -eq 'Passed')
     Get-NetworkResults $DashboardServer
-    Get-InstallStateResult ([bool]$service) (Test-Path -LiteralPath $program -PathType Leaf) (Test-Path -LiteralPath $data -PathType Leaf)
+    Get-InstallStateResult ([bool]$service) (Test-Path -LiteralPath $program -PathType Leaf) (Test-Path -LiteralPath $data -PathType Leaf) -StagedBinary:$Installed
     Get-TightVNCResults
     Get-FilesystemResult
     Get-ServiceConfigurationResult $program
@@ -223,7 +237,7 @@ function Invoke-HospitalPreflight {
 
 if ($MyInvocation.InvocationName -ne '.') {
   if ([string]::IsNullOrWhiteSpace($Server)) { throw 'Server is required.' }
-  $results = @(Invoke-HospitalPreflight -DashboardServer $Server -Root $PackageRoot)
+  $results = @(Invoke-HospitalPreflight -DashboardServer $Server -Root $PackageRoot -Installed:$InstalledLayout)
   if ($Json) { $results | ConvertTo-Json -Depth 3 } else { $results | Format-Table -AutoSize | Out-Host }
   exit (Get-PreflightExitCode $results)
 }
